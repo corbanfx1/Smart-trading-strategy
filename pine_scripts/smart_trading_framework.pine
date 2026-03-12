@@ -1,0 +1,619 @@
+// =============================================================================
+// SMART TRADING FRAMEWORK v2.0
+// ICT / SMC Multi-Timeframe Analysis
+// =============================================================================
+// Methodology:
+//   • Daily/4H Bias  → defines directional bias
+//   • 1H Timing      → entry trigger & confirmation
+//   • Structure      → BOS / CHoCH + liquidity sweeps/runs
+//   • POI            → Order Blocks (OB) + Fair Value Gaps (FVG)
+//   • Context        → Premium / Discount (P/D) zones
+//   • Order Flow     → CVD slope/divergence, delta flips, absorption, imbalances
+//   • Institutional  → Accumulation / Manipulation / Distribution phase
+// =============================================================================
+//@version=5
+indicator("Smart Trading Framework | ICT/SMC v2", shorttitle="STF v2",
+          overlay=true, max_lines_count=500, max_boxes_count=500, max_labels_count=500)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Timeframes
+g_tf = "⏱  Timeframes"
+i_htf       = input.timeframe("D",   "Daily Bias TF",   group=g_tf)
+i_htf4      = input.timeframe("240", "4H Bias TF",      group=g_tf)
+i_itf       = input.timeframe("60",  "1H Timing TF",    group=g_tf)
+
+// Market Structure
+g_ms = "📊  Market Structure"
+i_show_bos    = input.bool(true,  "Show BOS",         group=g_ms)
+i_show_choch  = input.bool(true,  "Show CHoCH",       group=g_ms)
+i_swing_len   = input.int(10,     "Swing Length",     minval=3, maxval=50, group=g_ms)
+i_ms_lookback = input.int(50,     "Structure Lookback", minval=20, maxval=200, group=g_ms)
+
+// Order Blocks
+g_ob = "🧱  Order Blocks"
+i_show_ob     = input.bool(true,  "Show Order Blocks",  group=g_ob)
+i_ob_lookback = input.int(15,     "OB Search Window",   minval=3, maxval=50, group=g_ob)
+i_ob_mitigated = input.bool(true, "Show Mitigated OBs", group=g_ob)
+i_ob_bull_col = input.color(color.new(#26A69A, 80), "Bullish OB",  group=g_ob)
+i_ob_bear_col = input.color(color.new(#EF5350, 80), "Bearish OB",  group=g_ob)
+
+// Fair Value Gaps
+g_fvg = "⚡  Fair Value Gaps"
+i_show_fvg    = input.bool(true,   "Show FVGs",        group=g_fvg)
+i_fvg_min     = input.float(0.05,  "Min Size (%)",     step=0.01, minval=0.0, group=g_fvg)
+i_fvg_bull_col = input.color(color.new(#26A69A, 85), "Bullish FVG", group=g_fvg)
+i_fvg_bear_col = input.color(color.new(#EF5350, 85), "Bearish FVG", group=g_fvg)
+
+// Liquidity
+g_liq = "💧  Liquidity"
+i_show_liq    = input.bool(true,  "Show Liquidity Levels", group=g_liq)
+i_liq_len     = input.int(20,     "Liquidity Lookback",   minval=10, maxval=100, group=g_liq)
+i_eq_thresh   = input.float(0.1,  "EQH/EQL Threshold (%)", step=0.01, group=g_liq)
+i_show_sweep  = input.bool(true,  "Show Sweeps",          group=g_liq)
+
+// Premium / Discount
+g_pd = "💎  Premium / Discount"
+i_show_pd     = input.bool(true,  "Show P/D Zones",   group=g_pd)
+i_pd_len      = input.int(50,     "Range Length",     minval=10, maxval=500, group=g_pd)
+
+// Order Flow
+g_of = "🌊  Order Flow"
+i_show_of     = input.bool(true,  "Show Order Flow",   group=g_of)
+i_cvd_len     = input.int(14,     "CVD Period",        minval=5, group=g_of)
+i_abs_vol_mult = input.float(1.5, "Absorption Vol ×",  step=0.1, group=g_of)
+i_imb_body_mult = input.float(2.0, "Imbalance Body ×", step=0.1, group=g_of)
+i_cvd_bg      = input.bool(true,  "CVD Background",    group=g_of)
+
+// Institutional Phase
+g_ip = "🏦  Institutional Phase"
+i_show_phase  = input.bool(true,  "Show Phase Label",   group=g_ip)
+i_phase_len   = input.int(50,     "Phase Detection Length", minval=20, maxval=200, group=g_ip)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HELPER FUNCTIONS
+// ─────────────────────────────────────────────────────────────────────────────
+pct_diff(a, b) => math.abs(a - b) / b * 100
+mid(a, b)      => (a + b) / 2
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MULTI-TIMEFRAME BIAS  (Daily + 4H)
+// ─────────────────────────────────────────────────────────────────────────────
+[d_c, d_h, d_l, d_o] = request.security(syminfo.tickerid, i_htf,
+     [close, high, low, open], lookahead=barmerge.lookahead_off)
+[h4_c, h4_h, h4_l, h4_o] = request.security(syminfo.tickerid, i_htf4,
+     [close, high, low, open], lookahead=barmerge.lookahead_off)
+
+// Daily bias: Higher High + Higher Close = bullish; Lower Low + Lower Close = bearish
+d_bias_bull  = d_c > d_c[1] and d_h > d_h[1]
+d_bias_bear  = d_c < d_c[1] and d_l < d_l[1]
+daily_bias   = d_bias_bull ? 1 : d_bias_bear ? -1 : 0
+
+// 4H bias: structural higher highs/lows or lower highs/lows over 3 bars
+h4_bias_bull = h4_c > h4_c[3] and h4_h > h4_h[3] and h4_l > h4_l[3]
+h4_bias_bear = h4_c < h4_c[3] and h4_l < h4_l[3] and h4_h < h4_h[3]
+h4_bias      = h4_bias_bull ? 1 : h4_bias_bear ? -1 : 0
+
+// Confluence bias (both timeframes agree = stronger signal)
+mtf_bias_bull = daily_bias >= 0 and h4_bias == 1
+mtf_bias_bear = daily_bias <= 0 and h4_bias == -1
+mtf_bias      = mtf_bias_bull ? 1 : mtf_bias_bear ? -1 : 0
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SWING HIGHS & LOWS
+// ─────────────────────────────────────────────────────────────────────────────
+swing_h = ta.pivothigh(high, i_swing_len, i_swing_len)
+swing_l = ta.pivotlow (low,  i_swing_len, i_swing_len)
+
+// Track last 2 swing highs and lows (confirmed, so bar_index is offset by swing_len)
+var float sh1 = na, var float sh2 = na
+var float sl1 = na, var float sl2 = na
+var int   sh1_bar = na, var int sh2_bar = na
+var int   sl1_bar = na, var int sl2_bar = na
+
+if not na(swing_h)
+    sh2     := sh1
+    sh2_bar := sh1_bar
+    sh1     := swing_h
+    sh1_bar := bar_index[i_swing_len]
+
+if not na(swing_l)
+    sl2     := sl1
+    sl2_bar := sl1_bar
+    sl1     := swing_l
+    sl1_bar := bar_index[i_swing_len]
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MARKET STRUCTURE  –  BOS / CHoCH
+// ─────────────────────────────────────────────────────────────────────────────
+// BOS  (Break of Structure)  = price breaks swing in direction of prevailing trend
+// CHoCH (Change of Character) = price breaks swing AGAINST prevailing trend → reversal signal
+
+var int trend = 0  // 1 = bull, -1 = bear
+
+// Cross detection (bar where cross happened)
+bos_bull   = not na(sh1) and high > sh1 and high[1] <= sh1 and trend >= 0
+bos_bear   = not na(sl1) and low  < sl1 and low[1]  >= sl1 and trend <= 0
+choch_bull = not na(sh1) and high > sh1 and high[1] <= sh1 and trend < 0
+choch_bear = not na(sl1) and low  < sl1 and low[1]  >= sl1 and trend > 0
+
+if bos_bull or choch_bull
+    trend := 1
+if bos_bear or choch_bear
+    trend := -1
+
+// Draw BOS labels
+if i_show_bos
+    if bos_bull
+        label.new(bar_index, high, "BOS ▲",
+                  style=label.style_label_down, color=color.new(#26A69A, 10),
+                  textcolor=color.white, size=size.small)
+        if not na(sh1) and not na(sh1_bar)
+            line.new(sh1_bar, sh1, bar_index, sh1,
+                     color=color.new(#26A69A, 40), style=line.style_dashed)
+    if bos_bear
+        label.new(bar_index, low, "BOS ▼",
+                  style=label.style_label_up, color=color.new(#EF5350, 10),
+                  textcolor=color.white, size=size.small)
+        if not na(sl1) and not na(sl1_bar)
+            line.new(sl1_bar, sl1, bar_index, sl1,
+                     color=color.new(#EF5350, 40), style=line.style_dashed)
+
+// Draw CHoCH labels
+if i_show_choch
+    if choch_bull
+        label.new(bar_index, high, "CHoCH ▲",
+                  style=label.style_label_down, color=color.new(#64FFDA, 10),
+                  textcolor=color.black, size=size.small)
+        if not na(sh1) and not na(sh1_bar)
+            line.new(sh1_bar, sh1, bar_index, sh1,
+                     color=color.new(#64FFDA, 40), style=line.style_dotted, width=2)
+    if choch_bear
+        label.new(bar_index, low, "CHoCH ▼",
+                  style=label.style_label_up, color=color.new(#FF6D00, 10),
+                  textcolor=color.white, size=size.small)
+        if not na(sl1) and not na(sl1_bar)
+            line.new(sl1_bar, sl1, bar_index, sl1,
+                     color=color.new(#FF6D00, 40), style=line.style_dotted, width=2)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ORDER BLOCKS
+// ─────────────────────────────────────────────────────────────────────────────
+// Bullish OB  = last bearish candle before a bullish BOS/impulse
+// Bearish OB  = last bullish candle before a bearish BOS/impulse
+// Mitigation  = price returns into the OB zone (50% level touched)
+
+if i_show_ob
+    if bos_bull or choch_bull
+        ob_placed = false
+        for i = 1 to i_ob_lookback
+            if not ob_placed and close[i] < open[i]  // find last bearish candle
+                ob_top = open[i]
+                ob_bot = low[i]
+                // only draw if price hasn't fully closed through it yet
+                if close > ob_bot
+                    b = box.new(bar_index[i], ob_top, bar_index + 30, ob_bot,
+                                bgcolor=i_ob_bull_col,
+                                border_color=color.new(#26A69A, 30),
+                                extend=extend.right)
+                    label.new(bar_index[i], ob_top, "OB",
+                              style=label.style_label_down, size=size.tiny,
+                              color=color.new(#26A69A, 20), textcolor=color.white)
+                ob_placed := true
+
+    if bos_bear or choch_bear
+        ob_placed = false
+        for i = 1 to i_ob_lookback
+            if not ob_placed and close[i] > open[i]  // find last bullish candle
+                ob_top = high[i]
+                ob_bot = open[i]
+                if close < ob_top
+                    b = box.new(bar_index[i], ob_top, bar_index + 30, ob_bot,
+                                bgcolor=i_ob_bear_col,
+                                border_color=color.new(#EF5350, 30),
+                                extend=extend.right)
+                    label.new(bar_index[i], ob_bot, "OB",
+                              style=label.style_label_up, size=size.tiny,
+                              color=color.new(#EF5350, 20), textcolor=color.white)
+                ob_placed := true
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FAIR VALUE GAPS  (FVG / Imbalance)
+// ─────────────────────────────────────────────────────────────────────────────
+// Bullish FVG: gap between high[2] and low[0]   (candle before's high < current low)
+// Bearish FVG: gap between low[2]  and high[0]  (candle before's low  > current high)
+fvg_size_pct(top, bot) => bot > 0 ? (top - bot) / bot * 100 : 0.0
+
+bull_fvg = high[2] < low[0]  and fvg_size_pct(low[0],  high[2]) >= i_fvg_min
+bear_fvg = low[2]  > high[0] and fvg_size_pct(low[2],  high[0]) >= i_fvg_min
+
+if i_show_fvg
+    if bull_fvg
+        box.new(bar_index[1], low[0], bar_index + 40, high[2],
+                bgcolor=i_fvg_bull_col, border_color=color.new(#26A69A, 40),
+                extend=extend.right)
+        label.new(bar_index[1], mid(low[0], high[2]), "FVG",
+                  style=label.style_label_right, size=size.tiny,
+                  color=color.new(#26A69A, 40), textcolor=color.white)
+    if bear_fvg
+        box.new(bar_index[1], high[0], bar_index + 40, low[2],
+                bgcolor=i_fvg_bear_col, border_color=color.new(#EF5350, 40),
+                extend=extend.right)
+        label.new(bar_index[1], mid(high[0], low[2]), "FVG",
+                  style=label.style_label_right, size=size.tiny,
+                  color=color.new(#EF5350, 40), textcolor=color.white)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LIQUIDITY LEVELS  (BSL / SSL / EQH / EQL)
+// ─────────────────────────────────────────────────────────────────────────────
+// BSL = Buy-Side Liquidity  (above swing highs)
+// SSL = Sell-Side Liquidity (below swing lows)
+// EQH = Equal Highs  →  resting BSL (stop clusters)
+// EQL = Equal Lows   →  resting SSL (stop clusters)
+
+liq_ph = ta.pivothigh(high, i_liq_len, i_liq_len)
+liq_pl = ta.pivotlow (low,  i_liq_len, i_liq_len)
+
+var float[] arr_lh     = array.new_float(0)
+var int[]   arr_lh_bar = array.new_int(0)
+var float[] arr_ll     = array.new_float(0)
+var int[]   arr_ll_bar = array.new_int(0)
+
+int MAX_LIQ = 6
+if not na(liq_ph)
+    array.push(arr_lh,     liq_ph)
+    array.push(arr_lh_bar, bar_index[i_liq_len])
+    if array.size(arr_lh) > MAX_LIQ
+        array.shift(arr_lh)
+        array.shift(arr_lh_bar)
+
+if not na(liq_pl)
+    array.push(arr_ll,     liq_pl)
+    array.push(arr_ll_bar, bar_index[i_liq_len])
+    if array.size(arr_ll) > MAX_LIQ
+        array.shift(arr_ll)
+        array.shift(arr_ll_bar)
+
+// Liquidity sweeps  (wick beyond level, close back inside → stop hunt)
+bull_sweep = false
+bear_sweep = false
+
+for i = 0 to array.size(arr_ll) - 1
+    lvl = array.get(arr_ll, i)
+    if low < lvl and close > lvl     // swept low and recovered
+        bull_sweep := true
+
+for i = 0 to array.size(arr_lh) - 1
+    lvl = array.get(arr_lh, i)
+    if high > lvl and close < lvl    // swept high and rejected
+        bear_sweep := true
+
+if i_show_sweep
+    if bull_sweep
+        label.new(bar_index, low, "SWEEP SSL ⚡",
+                  style=label.style_label_up, size=size.small,
+                  color=color.new(#26A69A, 0), textcolor=color.white)
+    if bear_sweep
+        label.new(bar_index, high, "SWEEP BSL ⚡",
+                  style=label.style_label_down, size=size.small,
+                  color=color.new(#EF5350, 0), textcolor=color.white)
+
+// Draw persistent liquidity lines on last bar
+if i_show_liq and barstate.islast
+    for i = 0 to array.size(arr_lh) - 1
+        lh      = array.get(arr_lh, i)
+        lh_bar  = array.get(arr_lh_bar, i)
+        // Check equal highs
+        eq_cnt = 0
+        for j = 0 to array.size(arr_lh) - 1
+            if i != j
+                if pct_diff(lh, array.get(arr_lh, j)) <= i_eq_thresh
+                    eq_cnt += 1
+        lbl = eq_cnt > 0 ? "EQH ⚡" : "BSL"
+        line.new(lh_bar, lh, bar_index + 8, lh,
+                 color=color.new(#EF5350, 40), style=line.style_dashed, width=1)
+        label.new(bar_index + 8, lh, lbl,
+                  style=label.style_label_left, size=size.tiny,
+                  color=color.new(#EF5350, 60), textcolor=color.white)
+
+    for i = 0 to array.size(arr_ll) - 1
+        ll     = array.get(arr_ll, i)
+        ll_bar = array.get(arr_ll_bar, i)
+        eq_cnt = 0
+        for j = 0 to array.size(arr_ll) - 1
+            if i != j
+                if pct_diff(ll, array.get(arr_ll, j)) <= i_eq_thresh
+                    eq_cnt += 1
+        lbl = eq_cnt > 0 ? "EQL ⚡" : "SSL"
+        line.new(ll_bar, ll, bar_index + 8, ll,
+                 color=color.new(#26A69A, 40), style=line.style_dashed, width=1)
+        label.new(bar_index + 8, ll, lbl,
+                  style=label.style_label_left, size=size.tiny,
+                  color=color.new(#26A69A, 60), textcolor=color.white)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PREMIUM / DISCOUNT ZONES
+// ─────────────────────────────────────────────────────────────────────────────
+// Range midpoint = Equilibrium (EQ)
+// Above 75% of range = Deep Premium   (optimal short POI)
+// 50–75%             = Premium
+// 25–50%             = Discount
+// Below 25%          = Deep Discount  (optimal long POI)
+
+r_high  = ta.highest(high, i_pd_len)
+r_low   = ta.lowest (low,  i_pd_len)
+r_range = r_high - r_low
+r_eq    = r_low + r_range * 0.50
+r_p75   = r_low + r_range * 0.75
+r_d25   = r_low + r_range * 0.25
+
+in_premium      = close > r_eq
+in_discount     = close < r_eq
+in_deep_premium = close > r_p75
+in_deep_discount = close < r_d25
+
+if i_show_pd and barstate.islast
+    // Equilibrium line
+    line.new(bar_index - i_pd_len, r_eq, bar_index + 6, r_eq,
+             color=color.new(#9E9E9E, 20), style=line.style_dotted, width=2)
+    label.new(bar_index + 6, r_eq, "EQ",
+              style=label.style_label_left, size=size.tiny,
+              color=color.new(#9E9E9E, 40), textcolor=color.white)
+    // Premium zone
+    box.new(bar_index - i_pd_len, r_high, bar_index + 6, r_p75,
+            bgcolor=color.new(#EF5350, 90), border_color=color.na)
+    label.new(bar_index - i_pd_len + 2, r_high, "DEEP PREMIUM",
+              style=label.style_label_right, size=size.tiny,
+              color=color.new(#EF5350, 50), textcolor=color.white)
+    box.new(bar_index - i_pd_len, r_p75, bar_index + 6, r_eq,
+            bgcolor=color.new(#EF5350, 95), border_color=color.na)
+    label.new(bar_index - i_pd_len + 2, mid(r_p75, r_eq), "PREMIUM",
+              style=label.style_label_right, size=size.tiny,
+              color=color.new(#EF5350, 60), textcolor=color.white)
+    // Discount zone
+    box.new(bar_index - i_pd_len, r_eq, bar_index + 6, r_d25,
+            bgcolor=color.new(#26A69A, 95), border_color=color.na)
+    label.new(bar_index - i_pd_len + 2, mid(r_eq, r_d25), "DISCOUNT",
+              style=label.style_label_right, size=size.tiny,
+              color=color.new(#26A69A, 60), textcolor=color.white)
+    box.new(bar_index - i_pd_len, r_d25, bar_index + 6, r_low,
+            bgcolor=color.new(#26A69A, 90), border_color=color.na)
+    label.new(bar_index - i_pd_len + 2, r_low, "DEEP DISCOUNT",
+              style=label.style_label_right, size=size.tiny,
+              color=color.new(#26A69A, 50), textcolor=color.white)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ORDER FLOW  –  CVD / DELTA / ABSORPTION / IMBALANCE
+// ─────────────────────────────────────────────────────────────────────────────
+// CVD approximation: estimate buying vs selling pressure per candle
+//   Delta ≈ ((close-low)/(high-low) – (high-close)/(high-low)) × volume
+//   This splits total volume into estimated bid (sell) and ask (buy) portions.
+
+candle_range_raw = high - low
+safe_range       = candle_range_raw == 0 ? 0.000001 : candle_range_raw
+
+buy_vol  = (close - low)  / safe_range * volume
+sell_vol = (high - close) / safe_range * volume
+delta    = buy_vol - sell_vol
+cvd      = ta.cum(delta)
+
+// CVD slope over period (rising = buyers in control, falling = sellers)
+cvd_slope     = cvd - cvd[i_cvd_len]
+cvd_slope_pos = cvd_slope > 0
+cvd_slope_neg = cvd_slope < 0
+
+// CVD divergence (price vs CVD moving in opposite directions)
+price_up  = close > close[i_cvd_len]
+price_dn  = close < close[i_cvd_len]
+cvd_up    = cvd   > cvd[i_cvd_len]
+cvd_dn    = cvd   < cvd[i_cvd_len]
+
+bull_div = price_dn and cvd_up   // price down, CVD up  → hidden bull divergence
+bear_div = price_up and cvd_dn   // price up,  CVD down → hidden bear divergence
+
+// Delta flip at key zones (momentum reversal confirmation)
+delta_bull_flip = delta > 0 and delta[1] <= 0
+delta_bear_flip = delta < 0 and delta[1] >= 0
+
+// Absorption: large volume, tiny candle body → institutional absorption
+avg_vol  = ta.sma(volume, 20)
+avg_body = ta.sma(math.abs(close - open), 20)
+body     = math.abs(close - open)
+absorption = volume > avg_vol * i_abs_vol_mult and body < avg_body * 0.5
+
+// Imbalance candles: strong momentum, large body (institutional order flow)
+bull_imb = close > open and body > avg_body * i_imb_body_mult and close > close[1]
+bear_imb = close < open and body > avg_body * i_imb_body_mult and close < close[1]
+
+if i_show_of
+    if absorption
+        label.new(bar_index, low - syminfo.mintick * 3, "ABS",
+                  style=label.style_label_up, size=size.tiny,
+                  color=color.new(#9C27B0, 20), textcolor=color.white)
+    if bull_div
+        label.new(bar_index, low - syminfo.mintick * 6, "CVD DIV ↑",
+                  style=label.style_label_up, size=size.tiny,
+                  color=color.new(#FF9800, 10), textcolor=color.white)
+    if bear_div
+        label.new(bar_index, high + syminfo.mintick * 6, "CVD DIV ↓",
+                  style=label.style_label_down, size=size.tiny,
+                  color=color.new(#FF9800, 10), textcolor=color.white)
+    // Delta flips at liquidity zones are high-value signals
+    if delta_bull_flip and (in_discount or bull_sweep)
+        label.new(bar_index, low - syminfo.mintick * 10, "Δ FLIP ↑",
+                  style=label.style_label_up, size=size.small,
+                  color=color.new(#26A69A, 0), textcolor=color.white)
+    if delta_bear_flip and (in_premium or bear_sweep)
+        label.new(bar_index, high + syminfo.mintick * 10, "Δ FLIP ↓",
+                  style=label.style_label_down, size=size.small,
+                  color=color.new(#EF5350, 0), textcolor=color.white)
+    if bull_imb
+        label.new(bar_index, low, "IMB",
+                  style=label.style_label_up, size=size.tiny,
+                  color=color.new(#1565C0, 30), textcolor=color.white)
+    if bear_imb
+        label.new(bar_index, high, "IMB",
+                  style=label.style_label_down, size=size.tiny,
+                  color=color.new(#1565C0, 30), textcolor=color.white)
+
+// CVD background tint
+bgcolor(i_cvd_bg ? (cvd_slope_pos ? color.new(#26A69A, 96) : color.new(#EF5350, 96)) : na,
+        title="CVD Background")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INSTITUTIONAL PHASE  –  Accumulation / Manipulation / Distribution
+// ─────────────────────────────────────────────────────────────────────────────
+// Accumulation  : low volatility, tight range, high absorption → smart money loading
+// Manipulation  : liquidity sweep (stop hunt) into a P/D zone
+// Distribution  : high volatility, large range, momentum candles → smart money unloading
+
+range_std    = ta.stdev(close, i_phase_len)
+avg_std      = ta.sma(range_std, i_phase_len * 2)
+low_vol      = range_std < avg_std * 0.7
+high_vol     = range_std > avg_std * 1.3
+
+accum_phase  = low_vol  and absorption
+manip_phase  = (bull_sweep or bear_sweep)
+distrib_phase = high_vol and (bull_imb or bear_imb)
+
+phase_str = accum_phase ? "ACCUMULATION" : manip_phase ? "MANIPULATION" : distrib_phase ? "DISTRIBUTION" : "TRENDING"
+phase_col = accum_phase ? color.new(#9C27B0, 20) :
+            manip_phase ? color.new(#FF9800, 20) :
+            distrib_phase ? color.new(#EF5350, 20) : color.new(#607D8B, 20)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HIGH-PROBABILITY SETUP SCORING
+// ─────────────────────────────────────────────────────────────────────────────
+// Long conditions  (scored 0–7, fire at ≥ 4):
+//   1. MTF bias bullish
+//   2. 1H structure bullish (CHoCH or BOS up)
+//   3. Price in discount zone
+//   4. Bullish OB or FVG present
+//   5. Liquidity swept below (SSL run)
+//   6. Delta flip bullish
+//   7. CVD slope positive or bull divergence
+
+long_score  = (mtf_bias == 1  ? 1 : 0)
+            + ((choch_bull or bos_bull) ? 1 : 0)
+            + (in_discount ? 1 : 0)
+            + ((bull_fvg) ? 1 : 0)
+            + (bull_sweep ? 1 : 0)
+            + (delta_bull_flip ? 1 : 0)
+            + ((cvd_slope_pos or bull_div) ? 1 : 0)
+
+short_score = (mtf_bias == -1 ? 1 : 0)
+            + ((choch_bear or bos_bear) ? 1 : 0)
+            + (in_premium ? 1 : 0)
+            + ((bear_fvg) ? 1 : 0)
+            + (bear_sweep ? 1 : 0)
+            + (delta_bear_flip ? 1 : 0)
+            + ((cvd_slope_neg or bear_div) ? 1 : 0)
+
+long_signal  = long_score  >= 4
+short_signal = short_score >= 4
+
+if long_signal
+    label.new(bar_index, low - syminfo.mintick * 25,
+              "🎯 LONG  [" + str.tostring(long_score) + "/7]",
+              style=label.style_label_up, size=size.normal,
+              color=color.new(#26A69A, 0), textcolor=color.white)
+if short_signal
+    label.new(bar_index, high + syminfo.mintick * 25,
+              "🎯 SHORT [" + str.tostring(short_score) + "/7]",
+              style=label.style_label_down, size=size.normal,
+              color=color.new(#EF5350, 0), textcolor=color.white)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DASHBOARD TABLE
+// ─────────────────────────────────────────────────────────────────────────────
+var table dash = table.new(position.top_right, 2, 12,
+                            bgcolor=color.new(#0D0D1A, 5),
+                            border_color=color.new(#2A2A4A, 60), border_width=1,
+                            frame_color=color.new(#BB86FC, 60), frame_width=1)
+
+cell(col, row, txt, tc, bg) =>
+    table.cell(dash, col, row, txt, text_color=tc, bgcolor=bg,
+               text_size=size.small, text_halign=text.align_center)
+
+if barstate.islast
+    // Header
+    cell(0, 0,  "SMART TRADING FRAMEWORK", color.new(#BB86FC, 0), color.new(#1A1A30, 0))
+    cell(1, 0,  syminfo.ticker + "  " + timeframe.period + "m", color.new(#BB86FC, 0), color.new(#1A1A30, 0))
+
+    // Daily Bias
+    d_txt = daily_bias ==  1 ? "BULL ▲" : daily_bias == -1 ? "BEAR ▼" : "NEUT ●"
+    d_col = daily_bias ==  1 ? color.new(#26A69A, 0) : daily_bias == -1 ? color.new(#EF5350, 0) : color.new(#9E9E9E, 0)
+    cell(0, 1, "Daily Bias",  color.new(#BDBDBD, 0), color.new(#12122A, 0))
+    cell(1, 1, d_txt, d_col,  color.new(#12122A, 0))
+
+    // 4H Bias
+    h_txt = h4_bias ==  1 ? "BULL ▲" : h4_bias == -1 ? "BEAR ▼" : "NEUT ●"
+    h_col = h4_bias ==  1 ? color.new(#26A69A, 0) : h4_bias == -1 ? color.new(#EF5350, 0) : color.new(#9E9E9E, 0)
+    cell(0, 2, "4H Bias",   color.new(#BDBDBD, 0), color.new(#12122A, 0))
+    cell(1, 2, h_txt, h_col, color.new(#12122A, 0))
+
+    // Structure
+    s_txt = trend ==  1 ? "BULL ▲" : trend == -1 ? "BEAR ▼" : "NEUT ●"
+    s_col = trend ==  1 ? color.new(#26A69A, 0) : trend == -1 ? color.new(#EF5350, 0) : color.new(#9E9E9E, 0)
+    cell(0, 3, "Structure",  color.new(#BDBDBD, 0), color.new(#12122A, 0))
+    cell(1, 3, s_txt, s_col, color.new(#12122A, 0))
+
+    // P/D Zone
+    pd_txt = in_deep_premium ? "DEEP PREM ▲▲" : in_premium  ? "PREMIUM ▲" :
+             in_deep_discount ? "DEEP DISC ▼▼" : in_discount ? "DISCOUNT ▼" : "EQ ●"
+    pd_col = in_premium ? color.new(#EF5350, 0) : in_discount ? color.new(#26A69A, 0) : color.new(#9E9E9E, 0)
+    cell(0, 4, "P/D Zone",   color.new(#BDBDBD, 0), color.new(#12122A, 0))
+    cell(1, 4, pd_txt, pd_col, color.new(#12122A, 0))
+
+    // CVD Slope
+    cs_txt = cvd_slope_pos ? "POSITIVE ▲" : "NEGATIVE ▼"
+    cs_col = cvd_slope_pos ? color.new(#26A69A, 0) : color.new(#EF5350, 0)
+    cell(0, 5, "CVD Slope",   color.new(#BDBDBD, 0), color.new(#12122A, 0))
+    cell(1, 5, cs_txt, cs_col, color.new(#12122A, 0))
+
+    // CVD Divergence
+    div_txt = bull_div ? "BULL DIV ↑" : bear_div ? "BEAR DIV ↓" : "NONE"
+    div_col = bull_div ? color.new(#26A69A, 0) : bear_div ? color.new(#EF5350, 0) : color.new(#9E9E9E, 0)
+    cell(0, 6, "CVD Divergence", color.new(#BDBDBD, 0), color.new(#12122A, 0))
+    cell(1, 6, div_txt, div_col,  color.new(#12122A, 0))
+
+    // Absorption
+    abs_txt = absorption ? "DETECTED ⚠" : "NONE"
+    abs_col = absorption ? color.new(#9C27B0, 0) : color.new(#9E9E9E, 0)
+    cell(0, 7, "Absorption", color.new(#BDBDBD, 0), color.new(#12122A, 0))
+    cell(1, 7, abs_txt, abs_col, color.new(#12122A, 0))
+
+    // Sweep
+    sw_txt = bull_sweep ? "SSL SWEPT ▲" : bear_sweep ? "BSL SWEPT ▼" : "NONE"
+    sw_col = bull_sweep ? color.new(#26A69A, 0) : bear_sweep ? color.new(#EF5350, 0) : color.new(#9E9E9E, 0)
+    cell(0, 8, "Sweep",     color.new(#BDBDBD, 0), color.new(#12122A, 0))
+    cell(1, 8, sw_txt, sw_col, color.new(#12122A, 0))
+
+    // Phase
+    cell(0, 9,  "Phase",     color.new(#BDBDBD, 0), color.new(#12122A, 0))
+    cell(1, 9,  phase_str, phase_col, color.new(#12122A, 0))
+
+    // Scores
+    l_sc_col = long_score  >= 5 ? color.new(#26A69A, 0) : long_score  >= 3 ? color.new(#FF9800, 0) : color.new(#9E9E9E, 0)
+    s_sc_col = short_score >= 5 ? color.new(#EF5350, 0) : short_score >= 3 ? color.new(#FF9800, 0) : color.new(#9E9E9E, 0)
+    cell(0, 10, "Long Score",  color.new(#BDBDBD, 0), color.new(#12122A, 0))
+    cell(1, 10, str.tostring(long_score) + "/7", l_sc_col, color.new(#12122A, 0))
+    cell(0, 11, "Short Score", color.new(#BDBDBD, 0), color.new(#12122A, 0))
+    cell(1, 11, str.tostring(short_score) + "/7", s_sc_col, color.new(#12122A, 0))
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PLOTS
+// ─────────────────────────────────────────────────────────────────────────────
+plot(r_eq,  "Equilibrium", color=color.new(#9E9E9E, 60), style=plot.style_circles, linewidth=1)
+plot(sh1,   "Last Swing H", color=color.new(#EF5350, 70), style=plot.style_circles, linewidth=1)
+plot(sl1,   "Last Swing L", color=color.new(#26A69A, 70), style=plot.style_circles, linewidth=1)
+
+// Alert conditions
+alertcondition(long_signal,  "STF Long Setup",  "Smart Trading Framework: Long Setup Detected")
+alertcondition(short_signal, "STF Short Setup", "Smart Trading Framework: Short Setup Detected")
+alertcondition(bull_sweep,   "SSL Swept",       "Smart Trading Framework: Sell-Side Liquidity Swept")
+alertcondition(bear_sweep,   "BSL Swept",       "Smart Trading Framework: Buy-Side Liquidity Swept")
+alertcondition(choch_bull,   "CHoCH Bullish",   "Smart Trading Framework: Bullish CHoCH - Potential Reversal")
+alertcondition(choch_bear,   "CHoCH Bearish",   "Smart Trading Framework: Bearish CHoCH - Potential Reversal")

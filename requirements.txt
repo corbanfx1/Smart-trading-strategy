@@ -1,0 +1,17 @@
+# Smart Trading Framework – Python dependencies
+# Install with: pip install -r requirements.txt
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+yfinance>=0.2.36          # market data (OHLCV)
+pandas>=2.0.0
+numpy>=1.26.0
+
+# ── Visualisation ─────────────────────────────────────────────────────────────
+plotly>=5.18.0            # interactive charts (optional – needed for --chart flag)
+
+# ── Scientific / Signal processing ───────────────────────────────────────────
+scipy>=1.12.0             # optional – used for advanced signal analysis
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-dateutil>=2.9.0    # date parsing helpers
+pytz>=2024.1              # timezone support
