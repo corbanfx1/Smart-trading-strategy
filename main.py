@@ -8,6 +8,10 @@ Usage:
     python main.py --symbol ETH-USD
     python main.py --symbol AAPL --interval 1h --period 90d
     python main.py --symbol BTC-USD --chart     # save chart.html
+
+    # XAUUSD Institutional Analyst (SMC + VP + CVD + ML Meta-model)
+    python main.py --xauusd
+    python main.py --xauusd --period 90d --chart
 """
 
 from __future__ import annotations
@@ -182,22 +186,57 @@ def main():
     parser = argparse.ArgumentParser(
         description="Smart Trading Framework – TradingView Chart Analysis"
     )
-    parser.add_argument("--symbol",   default=cfg.DEFAULT_SYMBOL,   help="Ticker symbol (default: BTC-USD)")
-    parser.add_argument("--interval", default=cfg.DEFAULT_INTERVAL,  help="Base timeframe (default: 1h)")
-    parser.add_argument("--period",   default=cfg.DEFAULT_PERIOD,    help="Lookback period (default: 60d)")
-    parser.add_argument("--chart",    action="store_true",            help="Save interactive chart to chart.html")
-    parser.add_argument("--chart-path", default="chart.html",        help="Output path for chart HTML")
-    parser.add_argument("--quiet",    action="store_true",            help="Suppress verbose output")
+    parser.add_argument("--symbol",     default=cfg.DEFAULT_SYMBOL,  help="Ticker symbol (default: BTC-USD)")
+    parser.add_argument("--interval",   default=cfg.DEFAULT_INTERVAL, help="Base timeframe (default: 1h)")
+    parser.add_argument("--period",     default=cfg.DEFAULT_PERIOD,   help="Lookback period (default: 60d)")
+    parser.add_argument("--chart",      action="store_true",           help="Save interactive chart to chart.html")
+    parser.add_argument("--chart-path", default="chart.html",         help="Output path for chart HTML")
+    parser.add_argument("--quiet",      action="store_true",           help="Suppress verbose output")
+
+    # XAUUSD-specific analyst
+    parser.add_argument(
+        "--xauusd",
+        action="store_true",
+        help="Run full XAUUSD institutional analyst "
+             "(SMC + Volume Profile + CVD + p_xgb + p_lstm + Meta-model)",
+    )
+    parser.add_argument(
+        "--xauusd-symbol",
+        default="GC=F",
+        help="XAUUSD yfinance symbol (default: GC=F for Gold futures)",
+    )
+
     args = parser.parse_args()
 
-    run_analysis(
-        symbol=args.symbol,
-        interval=args.interval,
-        period=args.period,
-        save_chart=args.chart,
-        chart_path=args.chart_path,
-        verbose=not args.quiet,
-    )
+    if args.xauusd:
+        from analysis.xauusd_analyst import run_xauusd_analysis
+        report = run_xauusd_analysis(
+            symbol=args.xauusd_symbol,
+            interval=args.interval,
+            period=args.period,
+            verbose=not args.quiet,
+        )
+        print(report)
+
+        if args.chart:
+            # Build a chart using the generic pipeline for the XAUUSD symbol
+            run_analysis(
+                symbol=args.xauusd_symbol,
+                interval=args.interval,
+                period=args.period,
+                save_chart=True,
+                chart_path=args.chart_path,
+                verbose=False,
+            )
+    else:
+        run_analysis(
+            symbol=args.symbol,
+            interval=args.interval,
+            period=args.period,
+            save_chart=args.chart,
+            chart_path=args.chart_path,
+            verbose=not args.quiet,
+        )
 
 
 if __name__ == "__main__":
