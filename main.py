@@ -67,7 +67,9 @@ def train_models(
     log.info("=" * 60)
 
     # Use 1H as primary training timeframe (most data + best granularity)
-    df_train = data.get("1H") or data.get("4H") or data.get("1D")
+    df_train = (data.get("1H") if data.get("1H") is not None else
+                data.get("4H") if data.get("4H") is not None else
+                data.get("1D"))
     if df_train is None or len(df_train) < 200:
         raise RuntimeError("Insufficient data for training")
 
@@ -139,7 +141,7 @@ def run_analysis(
              current_price, atr_1h, atr_1d)
 
     # ── Build entry-TF feature matrix ─────────────────────────────────────────
-    entry_df = data.get("1H") or data.get("4H")
+    entry_df = data.get("1H") if data.get("1H") is not None else data.get("4H")
     if entry_df is None:
         log.error("No 1H/4H data available for signal generation")
         return {}
@@ -316,7 +318,9 @@ def main():
         xgb.load()
         lstm.load()
         # GARCH always refitted on fresh data
-        df_g = data.get("1H") or data.get("4H") or data.get("1D")
+        df_g = (data.get("1H") if data.get("1H") is not None else
+                data.get("4H") if data.get("4H") is not None else
+                data.get("1D"))
         if df_g is not None:
             garch.fit(df_g)
     else:

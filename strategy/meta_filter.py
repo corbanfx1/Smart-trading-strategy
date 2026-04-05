@@ -164,20 +164,28 @@ def check_session_filter(ts: Optional[pd.Timestamp] = None) -> bool:
 
 
 def check_mtf_alignment(tf_signals: dict[str, int],
-                         min_agree: int = MF["min_tf_alignment"]) -> bool:
-    """At least *min_agree* timeframe signals must match the trade direction."""
+                         direction:  int,
+                         min_agree: int = MF["min_tf_alignment"]) -> tuple[bool, int]:
+    """
+    At least *min_agree* timeframe signals must match *direction*.
+    The dominant TF bias must agree with the proposed trade direction,
+    not merely agree amongst themselves.
+    """
     if not tf_signals:
-        return True
+        return True, direction
     vals = [v for v in tf_signals.values() if v != 0]
     if not vals:
-        return False
-    dominant = max(set(vals), key=vals.count)
-    count    = vals.count(dominant)
-    ok       = count >= min_agree
+        log.debug("MetaFilter: MTF all neutral — blocked")
+        return False, 0
+    # Count how many TFs explicitly agree with the trade direction
+    agree_count = sum(1 for v in vals if v == direction)
+    ok = agree_count >= min_agree
     if not ok:
-        log.debug("MetaFilter: MTF alignment=%d/%d — blocked (signals=%s)",
-                  count, min_agree, tf_signals)
-    return ok, dominant
+        log.debug(
+            "MetaFilter: MTF direction=%+d agreement=%d/%d — blocked (signals=%s)",
+            direction, agree_count, min_agree, tf_signals,
+        )
+    return ok, direction
 
 
 # ─── MASTER META-FILTER ────────────────────────────────────────────────────────
@@ -269,12 +277,7 @@ class MetaModelFilter:
 
         # ── Layer 6: MTF Alignment ─────────────────────────────────────────────
         if tf_signals:
-            mtf_result = check_mtf_alignment(tf_signals)
-            if isinstance(mtf_result, tuple):
-                mtf_ok, mtf_dir = mtf_result
-            else:
-                mtf_ok = mtf_result
-                mtf_dir = direction
+            mtf_ok, mtf_dir = check_mtf_alignment(tf_signals, direction)
             if not mtf_ok:
                 self.filter_stats["mtf_fail"] += 1
                 result["filters_failed"].append("mtf_alignment")

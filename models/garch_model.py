@@ -85,15 +85,46 @@ class GARCHVolatilityModel:
 
     # ─── FORECAST ──────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _bars_per_year(df: pd.DataFrame) -> float:
+        """
+        Infer bars-per-year from the DataFrame's DatetimeIndex frequency.
+        Falls back to median timedelta inspection when freq is not set.
+        """
+        if isinstance(df.index, pd.DatetimeIndex) and len(df) >= 2:
+            try:
+                freq = df.index.freq or df.index.inferred_freq
+                if freq is not None:
+                    freq_str = str(freq).upper()
+                    if "D" in freq_str and "H" not in freq_str:
+                        return 252.0
+                    if "4H" in freq_str or "4T" in freq_str:
+                        return 252.0 * 6
+                    if freq_str.startswith("H") or freq_str.startswith("60"):
+                        return 252.0 * 24
+                    if "15" in freq_str:
+                        return 252.0 * 96
+            except Exception:
+                pass
+            # Fallback: use median bar duration
+            deltas = df.index[1:] - df.index[:-1]
+            median_sec = float(np.median([d.total_seconds() for d in deltas]))
+            if median_sec > 0:
+                return (365.25 * 24 * 3600) / median_sec
+        return 252.0  # safe default (daily)
+
     def forecast_volatility(self, df: pd.DataFrame,
                              horizon: int = None) -> dict:
         """
         Forecast conditional volatility *horizon* bars ahead.
         Returns vol forecast, vol regime, annualised vol, VaR/CVaR.
+        Annualisation uses the actual bar frequency of *df* so the model
+        is correctly calibrated whether fit on 1H, 4H, or daily data.
         """
         horizon = horizon or self.params["forecast_horizon"]
         returns = self._log_returns(df["close"])
         current_vol_rv = float(returns.rolling(20).std().iloc[-1])
+        bars_per_year  = self._bars_per_year(df)
 
         if self.fitted and self._arch_available:
             try:
@@ -101,18 +132,17 @@ class GARCHVolatilityModel:
                 var_h = fc.variance.iloc[-1].values          # (horizon,)
                 vol_h = np.sqrt(var_h)                       # % per bar
 
-                # Annualise based on timeframe (approximate)
-                bars_per_year = 252
-                ann_vol = float(vol_h[0]) * np.sqrt(bars_per_year) / 100
+                # Annualise using the correct bars-per-year for this timeframe
+                ann_vol  = float(vol_h[0]) * np.sqrt(bars_per_year) / 100
                 cond_vol = float(vol_h[0]) / 100
 
             except Exception as e:
                 log.warning("GARCH forecast failed (%s), using rolling std", e)
                 cond_vol = current_vol_rv / 100
-                ann_vol  = cond_vol * np.sqrt(252)
+                ann_vol  = cond_vol * np.sqrt(bars_per_year)
         else:
             cond_vol = current_vol_rv / 100
-            ann_vol  = cond_vol * np.sqrt(252)
+            ann_vol  = cond_vol * np.sqrt(bars_per_year)
 
         # Volatility regime
         if ann_vol < 0.08:
