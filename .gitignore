@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# ML model artifacts (large binaries – user should retrain locally)
+saved_models/*.pkl
+saved_models/*.pt
+saved_models/*.bin
+
+# Data cache
+cache/
+
+# Reports (generated at runtime)
+reports/*.html
+reports/*.png
+reports/*.json
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
