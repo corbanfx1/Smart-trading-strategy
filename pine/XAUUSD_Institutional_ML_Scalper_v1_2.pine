@@ -1,0 +1,763 @@
+//@version=6
+strategy("XAUUSD Institutional ML Scalper v1.2", shorttitle="XAU ML v1.2", overlay=true,
+     initial_capital=10000, currency=currency.USD, pyramiding=0,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     margin_long=20, margin_short=20,
+     commission_type=strategy.commission.percent, commission_value=0.0,
+     slippage=10, process_orders_on_close=false, calc_on_every_tick=false,
+     calc_on_order_fills=false, max_labels_count=200)
+
+// EDUCATIONAL RESEARCH STRATEGY — not a verified profitable trading system.
+// Intended for a 5-minute XAUUSD chart. Set chart to your intended broker feed.
+// All higher-timeframe values use the PREVIOUS completed HTF candle.
+//
+// v1.2 (see docs/CRITIQUE_AND_ROADMAP.md for the reasoning behind every change)
+//  * Rules layer = PRIMARY model (candidate generator). ML layer = META-model that
+//    decides take/skip and risk size (López de Prado meta-labelling).
+//  * Labels = realised net R of the ACTUAL exit ladder (25% 1R / 50% 2R / 25% 3R,
+//    break-even after TP1, time stop), not a binary "2R before 1R" proxy.
+//  * Two online learners per candidate: logistic P(net R > 0) and NLMS expected-R
+//    regression, each = global weights + shrunk per-regime deviations (hierarchical).
+//  * Online binned calibration of the logistic score; EV uses EMPIRICAL payoffs.
+//  * Trade only if BOTH learners agree (min of the two EVs).
+//  * Fixes: direction-blind "exhaustion" regime, label/exit mismatch, p-gate that
+//    dominated the EV gate, no break-even, no drawdown throttle, no room-to-liquidity,
+//    no cost-drag gate, correlated overlapping labels, un-normalised macro inputs.
+// This file has NOT been compiled in TradingView by the author — compile and fix any
+// syntax drift first, then run walk-forward before trusting any number it prints.
+
+// ── Inputs ────────────────────────────────────────────────────────────
+string G1 = "01 | Trading hours and economic events"
+string londonHours = input.session("0800-1700", "London session (Europe/London)", group=G1)
+string newYorkHours = input.session("0800-1700", "New York session (America/New_York)", group=G1)
+bool useLondon = input.bool(true, "Trade London", group=G1)
+bool useNY = input.bool(true, "Trade New York", group=G1)
+bool blockReleases = input.bool(true, "Block 08:30 / 14:00 New York release windows daily", group=G1)
+bool flattenOnClose = input.bool(true, "Flatten when the trading session ends", group=G1)
+float shockMult = input.float(3.0, "Shock bar: range / ATR above this blocks entries", minval=1.5, step=0.25, group=G1)
+int shockCooldown = input.int(6, "Bars to stand aside after a shock bar", minval=0, maxval=50, group=G1)
+bool useNews1 = input.bool(false, "Enable event 1", group=G1)
+int news1 = input.time(timestamp("01 Jan 2030 00:00 +0000"), "Event 1 (absolute date/time)", group=G1)
+bool useNews2 = input.bool(false, "Enable event 2", group=G1)
+int news2 = input.time(timestamp("02 Jan 2030 00:00 +0000"), "Event 2 (absolute date/time)", group=G1)
+bool useNews3 = input.bool(false, "Enable event 3", group=G1)
+int news3 = input.time(timestamp("03 Jan 2030 00:00 +0000"), "Event 3 (absolute date/time)", group=G1)
+int newsBefore = input.int(20, "Block minutes BEFORE event", minval=0, maxval=240, group=G1)
+int newsAfter = input.int(20, "Block minutes AFTER event", minval=0, maxval=240, group=G1)
+
+string G2 = "02 | Market regime, structure and volume"
+int atrLen = input.int(14, "ATR period", minval=5, group=G2)
+int swingLen = input.int(3, "Confirmed swing bars (each side)", minval=2, maxval=10, group=G2)
+float fvgMinAtr = input.float(0.08, "Minimum FVG size / ATR", minval=0.0, step=0.02, group=G2)
+int zoneLife = input.int(24, "Max FVG / OB age (5m bars)", minval=3, maxval=100, group=G2)
+int contextBars = input.int(8, "Recent setup context (bars)", minval=2, maxval=24, group=G2)
+float rsiLo = input.float(30.0, "Exhaustion: RSI at/below this = sell-side exhaustion", minval=10.0, maxval=40.0, group=G2)
+float rsiHi = input.float(70.0, "Exhaustion: RSI at/above this = buy-side exhaustion", minval=60.0, maxval=90.0, group=G2)
+
+string G3 = "03 | Sentiment proxies (same-timeframe, confirmed, z-scored)"
+string dxySymbol = input.symbol("TVC:DXY", "US dollar index", group=G3)
+string yieldSymbol = input.symbol("TVC:US10Y", "US 10-year yield", group=G3)
+string vixSymbol = input.symbol("CBOE:VIX", "Volatility index", group=G3)
+
+string G4 = "04 | ML meta-model"
+string learnMode = input.string("Walk-forward", "Training mode", options=["Walk-forward", "Frozen OOS"], group=G4)
+int trainingCutoff = input.time(timestamp("01 Jan 2026 00:00 +0000"), "Freeze at date/time (for Frozen OOS)", group=G4)
+int horizon = input.int(12, "Label horizon / max hold, in 5m candles", minval=3, maxval=48, group=G4)
+int minLabels = input.int(150, "Minimum matured ML labels before trading", minval=30, maxval=3000, group=G4)
+int dedupeBars = input.int(3, "Label de-duplication: min bars between queued samples (same side)", minval=0, maxval=24, group=G4)
+float learningRate = input.float(0.03, "SGD learning rate (decays with sample count)", minval=0.001, maxval=0.25, step=0.005, group=G4)
+float minProbability = input.float(0.45, "Minimum CALIBRATED P(net R > 0)", minval=0.20, maxval=0.90, step=0.01, group=G4)
+float minExpectedR = input.float(0.15, "Minimum ensemble expected R (net of cost)", minval=0.0, maxval=2.0, step=0.05, group=G4)
+float assumedCost = input.float(0.40, "Estimated round-trip execution cost (USD per oz)", minval=0.0, step=0.05, group=G4)
+float maxCostR = input.float(0.20, "Skip if cost / stop distance exceeds (R)", minval=0.02, maxval=1.0, step=0.01, group=G4)
+float minRoomR = input.float(1.0, "Min room to next major liquidity level (R)", minval=0.0, maxval=5.0, step=0.25, group=G4)
+bool confScale = input.bool(true, "Scale risk by ensemble expected R (0.5x - 1.5x)", group=G4)
+float evRef = input.float(0.40, "Expected R that earns 1.0x risk", minval=0.1, maxval=2.0, step=0.05, group=G4)
+
+string G5 = "05 | Risk and exits"
+float riskPct = input.float(0.5, "Equity risk per setup (%)", minval=0.05, maxval=2.0, step=0.05, group=G5)
+float minStopAtr = input.float(1.2, "Minimum stop distance / ATR", minval=0.5, maxval=3.0, step=0.1, group=G5)
+float maxStopAtr = input.float(3.5, "Maximum stop distance / ATR", minval=1.0, maxval=8.0, step=0.1, group=G5)
+float qtyStep = input.float(0.01, "Broker order quantity step", minval=0.0001, step=0.01, group=G5)
+float maxLeverage = input.float(5.0, "Max notional exposure / equity", minval=1.0, maxval=5.0, step=1.0, group=G5)
+int maxTradesDay = input.int(4, "Max entries per London calendar day", minval=1, maxval=20, group=G5)
+float dailyMaxLoss = input.float(3.0, "Daily closed+open equity loss limit (%)", minval=0.5, maxval=10.0, step=0.5, group=G5)
+float ddHalfPct = input.float(5.0, "Equity drawdown from peak that HALVES risk (%)", minval=1.0, maxval=30.0, step=0.5, group=G5)
+float ddHaltPct = input.float(10.0, "Equity drawdown from peak that HALTS new entries (%)", minval=2.0, maxval=50.0, step=0.5, group=G5)
+int cooldown = input.int(3, "Minimum bars after last entry", minval=0, maxval=50, group=G5)
+
+// ── Constants ─────────────────────────────────────────────────────────
+int NF = 11          // number of features (bias weight stored at index NF)
+int NREG = 4         // 0 compression, 1 transition, 2 expansion, 3 exhaustion
+float CAL_K = 15.0   // pseudo-count pulling each calibration bin toward the raw score
+
+// ── Safe helpers ──────────────────────────────────────────────────────
+f_clip(float x, float lo, float hi) =>
+    math.max(lo, math.min(hi, x))
+
+f_sigmoid(float z) =>
+    1.0 / (1.0 + math.exp(-f_clip(z, -12.0, 12.0)))
+
+f_inNewsWindow(bool enabled, int moment) =>
+    enabled and time_close >= moment - newsBefore * 60000 and time_close <= moment + newsAfter * 60000
+
+// Weighted dot product: w[off .. off+NF-1] . x + bias w[off+NF]
+f_dot(array<float> w, int off, array<float> x) =>
+    float acc = array.get(w, off + NF)
+    for j = 0 to NF - 1
+        acc += array.get(w, off + j) * array.get(x, j)
+    acc
+
+f_sumsq(array<float> x) =>
+    float acc = 0.0
+    for j = 0 to NF - 1
+        acc += array.get(x, j) * array.get(x, j)
+    acc
+
+// Logistic SGD step with L2 shrinkage (bias is not regularised).
+f_sgd(array<float> w, int off, array<float> x, float err, float lr, float l2) =>
+    for j = 0 to NF - 1
+        float wj = array.get(w, off + j)
+        array.set(w, off + j, wj + lr * (err * array.get(x, j) - l2 * wj))
+    array.set(w, off + NF, array.get(w, off + NF) + lr * err)
+    true
+
+// Normalised-LMS step with weight decay (forgetting) for the expected-R regression.
+f_nlms(array<float> w, int off, array<float> x, float step, float decay) =>
+    for j = 0 to NF - 1
+        array.set(w, off + j, array.get(w, off + j) * (1.0 - decay) + step * array.get(x, j))
+    array.set(w, off + NF, array.get(w, off + NF) + step)
+    true
+
+f_calibrate(float pRaw, array<float> binN, array<float> binW) =>
+    int idx = math.min(9, math.max(0, int(pRaw * 10.0)))
+    (array.get(binW, idx) + CAL_K * pRaw) / (array.get(binN, idx) + CAL_K)
+
+// Distance from px to the nearest of three reference levels that lie ABOVE / BELOW it.
+f_distAbove(float px, float a, float b, float c) =>
+    float d1 = (not na(a) and a > px) ? a - px : 1.0e10
+    float d2 = (not na(b) and b > px) ? b - px : 1.0e10
+    float d3 = (not na(c) and c > px) ? c - px : 1.0e10
+    math.min(d1, math.min(d2, d3))
+
+f_distBelow(float px, float a, float b, float c) =>
+    float d1 = (not na(a) and a < px) ? px - a : 1.0e10
+    float d2 = (not na(b) and b < px) ? px - b : 1.0e10
+    float d3 = (not na(c) and c < px) ? px - c : 1.0e10
+    math.min(d1, math.min(d2, d3))
+
+// One hypothetical trade whose outcome (net R of the real exit ladder) becomes a label.
+type Pending
+    int startBar
+    int dir
+    float risk
+    float entry
+    int reg
+    int stage
+    float remain
+    float realised
+    float pRaw
+    float cost
+    array<float> x
+
+// ── Basic gates and London-day loss guard ─────────────────────────────
+if timeframe.period != "5"
+    runtime.error("Use this strategy on a 5-minute chart.")
+
+bool inLondon = useLondon and not na(time(timeframe.period, londonHours, "Europe/London"))
+bool inNY = useNY and not na(time(timeframe.period, newYorkHours, "America/New_York"))
+bool sessionOK = inLondon or inNY
+bool newsOK = not (f_inNewsWindow(useNews1, news1) or f_inNewsWindow(useNews2, news2) or f_inNewsWindow(useNews3, news3))
+// Recurring US data windows (08:30 ET, 14:00 ET). Starts one bar early because entries fill on the NEXT open.
+bool inRelease = blockReleases and (not na(time(timeframe.period, "0820-0840", "America/New_York")) or
+     not na(time(timeframe.period, "1350-1410", "America/New_York")))
+bool highQualitySession = not na(time(timeframe.period, "0800-1030", "Europe/London")) or
+     not na(time(timeframe.period, "0800-1100", "America/New_York"))
+
+int londonDayKey = year(time, "Europe/London") * 10000 + month(time, "Europe/London") * 100 + dayofmonth(time, "Europe/London")
+bool newLondonDay = barstate.isfirst or londonDayKey != londonDayKey[1]
+var int entriesToday = 0
+var float startDayEquity = na
+var bool dailyBlocked = false
+if newLondonDay
+    entriesToday := 0
+    startDayEquity := strategy.equity
+    dailyBlocked := false
+// Latch the daily limit: a later equity recovery must not reopen the gate.
+if not na(startDayEquity) and strategy.equity <= startDayEquity * (1.0 - dailyMaxLoss / 100.0)
+    dailyBlocked := true
+bool dailyRiskOK = not na(startDayEquity) and not dailyBlocked
+
+// Peak-to-trough equity throttle: halve risk, then halt.
+var float peakEquity = na
+peakEquity := na(peakEquity) ? strategy.equity : math.max(peakEquity, strategy.equity)
+float ddPct = peakEquity > 0 ? (peakEquity - strategy.equity) / peakEquity * 100.0 : 0.0
+bool ddOK = ddPct < ddHaltPct
+float ddScale = ddPct >= ddHalfPct ? 0.5 : 1.0
+
+// ── Confirmed 15m and 1H directional alignment (+ trend strength in ATR units) ──
+[fast15, slow15, atr15] = request.security(syminfo.tickerid, "15",
+     [ta.ema(close, 20)[1], ta.ema(close, 50)[1], ta.atr(14)[1]], lookahead=barmerge.lookahead_on)
+[fast60, slow60, atr60] = request.security(syminfo.tickerid, "60",
+     [ta.ema(close, 20)[1], ta.ema(close, 50)[1], ta.atr(14)[1]], lookahead=barmerge.lookahead_on)
+bool htfLong = fast15 > slow15 and fast60 > slow60
+bool htfShort = fast15 < slow15 and fast60 < slow60
+bool htfNotShort = not htfShort
+bool htfNotLong = not htfLong
+float gap15 = atr15 > 0 ? (fast15 - slow15) / atr15 : 0.0
+float gap60 = atr60 > 0 ? (fast60 - slow60) / atr60 : 0.0
+float htfStrength = f_clip(0.5 * (gap15 + gap60) / 0.75, -1.0, 1.0)
+
+// ── Volatility, momentum and volume-delta proxies ─────────────────────
+float atr = ta.atr(atrLen)
+float atrBase = ta.sma(atr, 80)
+float atrRatio = atrBase > 0 ? atr / atrBase : 1.0
+float bbWidth = close != 0 ? 4.0 * ta.stdev(close, 20) / close : 0.0
+float bbBase = ta.sma(bbWidth, 80)
+float bbRatio = bbBase > 0 ? bbWidth / bbBase : 1.0
+float emaFast = ta.ema(close, 9)
+float emaSlow = ta.ema(close, 21)
+float rsi = ta.rsi(close, 14)
+float rsiLowRecent = ta.lowest(rsi, contextBars)
+float rsiHighRecent = ta.highest(rsi, contextBars)
+[diPlus, diMinus, adx] = ta.dmi(14, 14)
+float roc5 = ta.roc(close, 5)
+float momentum = f_clip((emaFast - emaSlow) / math.max(atr * 2.0, syminfo.mintick) +
+     (rsi - 50.0) / 65.0 + f_clip(roc5 / 0.30, -1.0, 1.0) * 0.20, -1.0, 1.0)
+
+// Close-location delta estimate (Chaikin-style). NOT authentic bid/ask delta; on spot/CFD
+// gold the volume is tick volume. Treat as a weak, collinear-with-wick feature.
+float safeVol = nz(volume, 0.0)
+float delta = safeVol * (2.0 * close - high - low) / math.max(high - low, syminfo.mintick)
+float cvd = ta.cum(delta)
+float deltaEma = ta.ema(delta, 5)
+float volumeBase = ta.ema(safeVol, 20)
+float cvdSlope = (cvd - nz(cvd[5], cvd)) / math.max(volumeBase * 5.0, 1.0)
+float deltaScore = f_clip(0.60 * deltaEma / math.max(volumeBase, 1.0) + 0.40 * cvdSlope, -1.0, 1.0)
+bool volumeOK = safeVol > 0 and volumeBase > 0
+
+// Shock-bar filter: a bar far larger than normal range usually means news/illiquidity.
+float prevAtr = nz(atr[1], atr)
+bool shockBar = (high - low) > shockMult * math.max(prevAtr, syminfo.mintick)
+bool shockOK = nz(ta.barssince(shockBar), 1000) > shockCooldown
+
+// Regimes. Exhaustion is DIRECTIONAL: an RSI extreme within the last contextBars.
+bool exhaustionBull = atrRatio > 1.15 and adx > 20 and rsiLowRecent <= rsiLo    // washout lows -> long reversal
+bool exhaustionBear = atrRatio > 1.15 and adx > 20 and rsiHighRecent >= rsiHi   // blow-off highs -> short reversal
+bool exhaustion = exhaustionBull or exhaustionBear
+bool compression = not exhaustion and (atrRatio < 0.85 or bbRatio < 0.75)
+bool expansion = not exhaustion and not compression and atrRatio > 1.15 and adx > 22
+bool transition = not exhaustion and not compression and not expansion
+string regime = exhaustion ? "EXHAUSTION" : compression ? "COMPRESSION" : expansion ? "EXPANSION" : "TRANSITION"
+
+// ── Macro sentiment: PREVIOUS completed 5m bar, z-scored against its own 200-bar history ──
+float dxyZ = request.security(dxySymbol, timeframe.period,
+     ta.roc(close, 12)[1] / math.max(ta.stdev(ta.roc(close, 12), 200)[1], 0.000001),
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+float yieldZ = request.security(yieldSymbol, timeframe.period,
+     ta.roc(close, 12)[1] / math.max(ta.stdev(ta.roc(close, 12), 200)[1], 0.000001),
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+float vixZ = request.security(vixSymbol, timeframe.period,
+     ta.roc(close, 12)[1] / math.max(ta.stdev(ta.roc(close, 12), 200)[1], 0.000001),
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on, ignore_invalid_symbol=true)
+float macroNumerator = 0.0
+float macroWeight = 0.0
+if not na(dxyZ)
+    macroNumerator += -0.5 * f_clip(dxyZ / 2.5, -1.0, 1.0)
+    macroWeight += 0.5
+if not na(yieldZ)
+    macroNumerator += -0.3 * f_clip(yieldZ / 2.5, -1.0, 1.0)
+    macroWeight += 0.3
+if not na(vixZ)
+    macroNumerator += 0.2 * f_clip(vixZ / 2.5, -1.0, 1.0)
+    macroWeight += 0.2
+float sentiment = macroWeight > 0 ? macroNumerator / macroWeight : 0.0
+string macroStatus = macroWeight == 0 ? "PROXIES MISSING" : "PROXIES AVAILABLE"
+
+// ── Fixed, known liquidity reference points ──────────────────────────
+float pdHigh = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+float pdLow = request.security(syminfo.tickerid, "D", low[1], lookahead=barmerge.lookahead_on)
+float swingH = ta.pivothigh(high, swingLen, swingLen)
+float swingL = ta.pivotlow(low, swingLen, swingLen)
+var float latestSwingH = na
+var int lastSwingHBar = na
+var float latestSwingL = na
+var int lastSwingLBar = na
+if not na(swingH)
+    latestSwingH := swingH
+    lastSwingHBar := bar_index - swingLen
+if not na(swingL)
+    latestSwingL := swingL
+    lastSwingLBar := bar_index - swingLen
+
+bool inAsia = not na(time(timeframe.period, "0000-0800", "Europe/London"))
+var float asiaHigh = na
+var float asiaLow = na
+if newLondonDay
+    asiaHigh := na
+    asiaLow := na
+if inAsia
+    asiaHigh := na(asiaHigh) ? high : math.max(asiaHigh, high)
+    asiaLow := na(asiaLow) ? low : math.min(asiaLow, low)
+
+// Sweeps are split by liquidity quality: prior-day extreme > Asia extreme > 3-bar swing.
+bool bullSweepPD = not na(pdLow) and low < pdLow and close > pdLow
+bool bullSweepAsia = not inAsia and not na(asiaLow) and low < asiaLow and close > asiaLow
+bool bullSweepSwing = not na(latestSwingL) and low < latestSwingL and close > latestSwingL
+bool bearSweepPD = not na(pdHigh) and high > pdHigh and close < pdHigh
+bool bearSweepAsia = not inAsia and not na(asiaHigh) and high > asiaHigh and close < asiaHigh
+bool bearSweepSwing = not na(latestSwingH) and high > latestSwingH and close < latestSwingH
+bool bullSweep = bullSweepPD or bullSweepAsia or bullSweepSwing
+bool bearSweep = bearSweepPD or bearSweepAsia or bearSweepSwing
+
+float body = math.abs(close - open)
+bool bullDisplacement = close > open and body >= atr * 0.8 and safeVol >= volumeBase * 0.85
+bool bearDisplacement = close < open and body >= atr * 0.8 and safeVol >= volumeBase * 0.85
+bool bullBos = not na(latestSwingH) and close > latestSwingH and close[1] <= latestSwingH and bullDisplacement
+bool bearBos = not na(latestSwingL) and close < latestSwingL and close[1] >= latestSwingL and bearDisplacement
+var int structuralTrend = 0
+bool bullChoch = bullBos and structuralTrend == -1
+bool bearChoch = bearBos and structuralTrend == 1
+if bullBos
+    structuralTrend := 1
+if bearBos
+    structuralTrend := -1
+
+// Fresh fair-value gaps use three completed candles; retests cannot use the creation candle.
+bool newBullFVG = low > high[2] and low - high[2] > atr * fvgMinAtr and close > open
+bool newBearFVG = high < low[2] and low[2] - high > atr * fvgMinAtr and close < open
+var float bullGapTop = na
+var float bullGapBottom = na
+var int bullGapBar = na
+var float bearGapTop = na
+var float bearGapBottom = na
+var int bearGapBar = na
+if newBullFVG
+    bullGapTop := low
+    bullGapBottom := high[2]
+    bullGapBar := bar_index
+if newBearFVG
+    bearGapTop := low[2]
+    bearGapBottom := high
+    bearGapBar := bar_index
+// A gap that price has closed completely through is mitigated and no longer a valid zone.
+if not na(bullGapBottom) and close < bullGapBottom
+    bullGapBar := na
+if not na(bearGapTop) and close > bearGapTop
+    bearGapBar := na
+bool bullFvgRetest = not na(bullGapBar) and bar_index > bullGapBar and
+     bar_index - bullGapBar <= zoneLife and low <= bullGapTop and close > bullGapBottom and close > open
+bool bearFvgRetest = not na(bearGapBar) and bar_index > bearGapBar and
+     bar_index - bearGapBar <= zoneLife and high >= bearGapBottom and close < bearGapTop and close < open
+
+// A simplified OB is the most recent opposite candle at the BOS, max 8 bars back.
+float lastBearHigh = ta.valuewhen(close < open, high, 0)
+float lastBearLow = ta.valuewhen(close < open, low, 0)
+int lastBearIndex = ta.valuewhen(close < open, bar_index, 0)
+float lastBullHigh = ta.valuewhen(close > open, high, 0)
+float lastBullLow = ta.valuewhen(close > open, low, 0)
+int lastBullIndex = ta.valuewhen(close > open, bar_index, 0)
+var float bullObHigh = na
+var float bullObLow = na
+var int bullObBar = na
+var float bearObHigh = na
+var float bearObLow = na
+var int bearObBar = na
+if bullBos and not na(lastBearIndex) and bar_index - lastBearIndex <= 8
+    bullObHigh := lastBearHigh
+    bullObLow := lastBearLow
+    bullObBar := bar_index
+if bearBos and not na(lastBullIndex) and bar_index - lastBullIndex <= 8
+    bearObHigh := lastBullHigh
+    bearObLow := lastBullLow
+    bearObBar := bar_index
+if not na(bullObLow) and close < bullObLow
+    bullObBar := na
+if not na(bearObHigh) and close > bearObHigh
+    bearObBar := na
+bool bullObRetest = not na(bullObBar) and bar_index > bullObBar and
+     bar_index - bullObBar <= zoneLife and low <= bullObHigh and close > bullObLow and close > open
+bool bearObRetest = not na(bearObBar) and bar_index > bearObBar and
+     bar_index - bearObBar <= zoneLife and high >= bearObLow and close < bearObHigh and close < open
+
+int ageBullSweep = nz(ta.barssince(bullSweep), 100000)
+int ageBearSweep = nz(ta.barssince(bearSweep), 100000)
+int ageBullSweepPD = nz(ta.barssince(bullSweepPD), 100000)
+int ageBearSweepPD = nz(ta.barssince(bearSweepPD), 100000)
+int ageBullSweepAsia = nz(ta.barssince(bullSweepAsia), 100000)
+int ageBearSweepAsia = nz(ta.barssince(bearSweepAsia), 100000)
+int ageBullBOS = nz(ta.barssince(bullBos), 100000)
+int ageBearBOS = nz(ta.barssince(bearBos), 100000)
+int ageBullCHOCH = nz(ta.barssince(bullChoch), 100000)
+int ageBearCHOCH = nz(ta.barssince(bearChoch), 100000)
+int ageBullFVG = nz(ta.barssince(newBullFVG), 100000)
+int ageBearFVG = nz(ta.barssince(newBearFVG), 100000)
+float wickStrengthBull = (close - low) / math.max(high - low, syminfo.mintick)
+float wickStrengthBear = (high - close) / math.max(high - low, syminfo.mintick)
+
+// HTF rule: trend setups need full 15m+1H alignment; reversal setups only need it NOT to be opposed.
+bool compressionLong = compression and htfNotShort and bullSweep and wickStrengthBull >= 0.70 and deltaScore > -0.3
+bool compressionShort = compression and htfNotLong and bearSweep and wickStrengthBear >= 0.70 and deltaScore < 0.3
+bool transitionLong = transition and htfLong and bullBos and bullDisplacement and ageBullFVG <= 3 and ageBullSweep <= contextBars
+bool transitionShort = transition and htfShort and bearBos and bearDisplacement and ageBearFVG <= 3 and ageBearSweep <= contextBars
+bool expansionLong = expansion and htfLong and ageBullBOS <= contextBars and
+     ((bullFvgRetest or bullObRetest) or (bullBos and ageBullFVG <= 2)) and close > emaFast
+bool expansionShort = expansion and htfShort and ageBearBOS <= contextBars and
+     ((bearFvgRetest or bearObRetest) or (bearBos and ageBearFVG <= 2)) and close < emaFast
+bool exhaustionLong = exhaustionBull and htfNotShort and ageBullSweep <= contextBars and ageBullCHOCH <= contextBars and close > emaFast
+bool exhaustionShort = exhaustionBear and htfNotLong and ageBearSweep <= contextBars and ageBearCHOCH <= contextBars and close < emaFast
+
+// Candidates train the model WHETHER OR NOT their ML score passes the trade filter.
+bool eligibleBase = barstate.isconfirmed and sessionOK and newsOK and not inRelease and shockOK and
+     volumeOK and not na(atr) and not na(momentum) and not na(atrBase)
+bool candLong = eligibleBase and (compressionLong or transitionLong or expansionLong or exhaustionLong)
+bool candShort = eligibleBase and (compressionShort or transitionShort or expansionShort or exhaustionShort)
+int regL = exhaustionBull ? 3 : compression ? 0 : expansion ? 2 : 1
+int regS = exhaustionBear ? 3 : compression ? 0 : expansion ? 2 : 1
+
+// ── Hypothetical next-open stop distance ──────────────────────────────
+float recentLow = ta.lowest(low, 6)
+float recentHigh = ta.highest(high, 6)
+float localLow3 = ta.lowest(low, 3)
+float localHigh3 = ta.highest(high, 3)
+float referenceLow = not na(lastSwingLBar) and bar_index - lastSwingLBar <= 24 ? math.min(latestSwingL, localLow3) : recentLow
+float referenceHigh = not na(lastSwingHBar) and bar_index - lastSwingHBar <= 24 ? math.max(latestSwingH, localHigh3) : recentHigh
+float unboundedLongRisk = close - referenceLow + atr * 0.15
+float unboundedShortRisk = referenceHigh - close + atr * 0.15
+// Use a whole-tick distance for BOTH simulated training outcomes and live orders.
+float riskLong = math.ceil(math.max(minStopAtr * atr, unboundedLongRisk) / syminfo.mintick) * syminfo.mintick
+float riskShort = math.ceil(math.max(minStopAtr * atr, unboundedShortRisk) / syminfo.mintick) * syminfo.mintick
+bool longStopOK = not na(riskLong) and riskLong > 0 and riskLong <= maxStopAtr * atr
+bool shortStopOK = not na(riskShort) and riskShort > 0 and riskShort <= maxStopAtr * atr
+int ticksLong = longStopOK ? int(math.round(riskLong / syminfo.mintick)) : 1
+int ticksShort = shortStopOK ? int(math.round(riskShort / syminfo.mintick)) : 1
+float costRLong = longStopOK ? assumedCost / riskLong : 9.9
+float costRShort = shortStopOK ? assumedCost / riskShort : 9.9
+
+// Room to the next MAJOR level (prior day, Asia, 60-bar range extreme), measured in R.
+float rangeHigh60 = ta.highest(high, 60)
+float rangeLow60 = ta.lowest(low, 60)
+float distUp = f_distAbove(close, pdHigh, asiaHigh, rangeHigh60)
+float distDn = f_distBelow(close, pdLow, asiaLow, rangeLow60)
+float roomLong = longStopOK ? (distUp >= 1.0e9 ? 5.0 : distUp / riskLong) : 0.0
+float roomShort = shortStopOK ? (distDn >= 1.0e9 ? 5.0 : distDn / riskShort) : 0.0
+
+// ── Online learners: global weights + shrunk per-regime deviations ────
+var wCG = array.new<float>(NF + 1, 0.0)          // logistic, global
+var wCR = array.new<float>(NREG * (NF + 1), 0.0) // logistic, per regime
+var wRG = array.new<float>(NF + 1, 0.0)          // expected-R regression, global
+var wRR = array.new<float>(NREG * (NF + 1), 0.0) // expected-R regression, per regime
+var binN = array.new<float>(10, 0.0)             // calibration: samples per score bin
+var binW = array.new<float>(10, 0.0)             // calibration: positives per score bin
+var int trained = 0
+var int trainedWins = 0
+var float sumWinR = 16.0    // priors: 10 pseudo-wins averaging +1.6R, 10 pseudo-losses averaging -0.9R
+var float nWinR = 10.0
+var float sumLossR = 9.0
+var float nLossR = 10.0
+var float brier = na
+var pend = array.new<Pending>()
+if barstate.isfirst
+    array.set(wCG, NF, -0.40)   // logit(0.40): start near a plausible base rate, not at 50%
+
+// Mature labels BEFORE scoring a new signal. Reverse order so removals don't skip entries.
+if barstate.isconfirmed and array.size(pend) > 0
+    for i = array.size(pend) - 1 to 0
+        Pending s = array.get(pend, i)
+        if bar_index > s.startBar
+            if na(s.entry)
+                s.entry := open
+            float hiR = s.dir == 1 ? (high - s.entry) / s.risk : (s.entry - low) / s.risk
+            float loR = s.dir == 1 ? (low - s.entry) / s.risk : (s.entry - high) / s.risk
+            float stopR = s.stage == 0 ? -1.0 : 0.0   // stop moves to break-even after TP1
+            bool done = false
+            if loR <= stopR
+                // Stop-first if the same historical candle spans stop AND target (conservative).
+                s.realised := s.realised + s.remain * stopR
+                s.remain := 0.0
+                done := true
+            else
+                if s.stage < 1 and hiR >= 1.0
+                    s.realised := s.realised + 0.25
+                    s.remain := s.remain - 0.25
+                    s.stage := 1
+                if s.stage < 2 and hiR >= 2.0
+                    s.realised := s.realised + 1.0
+                    s.remain := s.remain - 0.50
+                    s.stage := 2
+                if s.stage < 3 and hiR >= 3.0
+                    s.realised := s.realised + 0.75
+                    s.remain := 0.0
+                    s.stage := 3
+                    done := true
+            if not done and bar_index - s.startBar >= horizon
+                float closeR = s.dir == 1 ? (close - s.entry) / s.risk : (s.entry - close) / s.risk
+                s.realised := s.realised + s.remain * closeR
+                s.remain := 0.0
+                done := true
+            if done
+                float netR = s.realised - s.cost
+                float y = netR > 0 ? 1.0 : 0.0
+                bool canLearn = learnMode == "Walk-forward" or time_close < trainingCutoff
+                if canLearn
+                    int off = s.reg * (NF + 1)
+                    float lr = learningRate / (1.0 + trained / 300.0)
+                    // Logistic: global + regime logits, regime weights shrunk 5x harder.
+                    float pHat = f_sigmoid(f_dot(wCG, 0, s.x) + f_dot(wCR, off, s.x))
+                    float err = y - pHat
+                    f_sgd(wCG, 0, s.x, err, lr, 0.0008)
+                    f_sgd(wCR, off, s.x, err, lr, 0.0040)
+                    // Expected R: NLMS on the (clipped) realised net R.
+                    float rHat = f_dot(wRG, 0, s.x) + f_dot(wRR, off, s.x)
+                    float rErr = f_clip(netR, -1.5, 3.5) - rHat
+                    float stepR = 4.0 * lr * rErr / (2.0 * (1.0 + f_sumsq(s.x)))
+                    f_nlms(wRG, 0, s.x, stepR, 0.0005)
+                    f_nlms(wRR, off, s.x, stepR, 0.0030)
+                    // Calibration bin, empirical payoffs, skill tracking.
+                    int bi = math.min(9, math.max(0, int(s.pRaw * 10.0)))
+                    array.set(binN, bi, array.get(binN, bi) + 1.0)
+                    array.set(binW, bi, array.get(binW, bi) + y)
+                    if y == 1.0
+                        sumWinR += netR
+                        nWinR += 1.0
+                        trainedWins += 1
+                    else
+                        sumLossR += -netR
+                        nLossR += 1.0
+                    float e2 = (s.pRaw - y) * (s.pRaw - y)
+                    brier := na(brier) ? e2 : brier * 0.98 + e2 * 0.02
+                    trained += 1
+                array.remove(pend, i)
+
+// ── Features (all roughly in [-1, 1]; directional ones flip sign for shorts) ──
+float avgWinR = sumWinR / nWinR
+float avgLossR = sumLossR / nLossR
+float volFeat = f_clip((atrRatio - 1.0) / 0.5, -1.0, 1.0)
+float adxFeat = f_clip((adx - 20.0) / 20.0, -1.0, 1.0)
+float sessFeat = highQualitySession ? 1.0 : -0.5
+
+float lConfluence = (ageBullSweep <= contextBars ? 0.30 : 0.0) +
+     (ageBullBOS <= contextBars ? 0.25 : 0.0) +
+     ((bullFvgRetest or bullObRetest) ? 0.25 : 0.0) +
+     (bullDisplacement ? 0.20 : 0.0)
+float sConfluence = (ageBearSweep <= contextBars ? 0.30 : 0.0) +
+     (ageBearBOS <= contextBars ? 0.25 : 0.0) +
+     ((bearFvgRetest or bearObRetest) ? 0.25 : 0.0) +
+     (bearDisplacement ? 0.20 : 0.0)
+float lLiq = ageBullSweepPD <= contextBars ? 1.0 : ageBullSweepAsia <= contextBars ? 0.7 : ageBullSweep <= contextBars ? 0.35 : 0.0
+float sLiq = ageBearSweepPD <= contextBars ? 1.0 : ageBearSweepAsia <= contextBars ? 0.7 : ageBearSweep <= contextBars ? 0.35 : 0.0
+
+array<float> xL = array.from(nz(momentum), nz(htfStrength), nz(2.0 * f_clip(lConfluence, 0.0, 1.0) - 1.0),
+     nz(sentiment), nz(deltaScore), nz(volFeat), nz(adxFeat),
+     nz(2.0 * f_clip(roomLong, 0.0, 4.0) / 4.0 - 1.0), sessFeat, 2.0 * lLiq - 1.0,
+     nz(2.0 * wickStrengthBull - 1.0))
+array<float> xS = array.from(nz(-momentum), nz(-htfStrength), nz(2.0 * f_clip(sConfluence, 0.0, 1.0) - 1.0),
+     nz(-sentiment), nz(-deltaScore), nz(volFeat), nz(adxFeat),
+     nz(2.0 * f_clip(roomShort, 0.0, 4.0) / 4.0 - 1.0), sessFeat, 2.0 * sLiq - 1.0,
+     nz(2.0 * wickStrengthBear - 1.0))
+
+float pRawL = f_sigmoid(f_dot(wCG, 0, xL) + f_dot(wCR, regL * (NF + 1), xL))
+float pRawS = f_sigmoid(f_dot(wCG, 0, xS) + f_dot(wCR, regS * (NF + 1), xS))
+float pCalL = f_calibrate(pRawL, binN, binW)
+float pCalS = f_calibrate(pRawS, binN, binW)
+// Two independent EV estimates; the trade needs BOTH, so use the smaller.
+float evPL = pCalL * avgWinR - (1.0 - pCalL) * avgLossR
+float evPS = pCalS * avgWinR - (1.0 - pCalS) * avgLossR
+float evRL = f_dot(wRG, 0, xL) + f_dot(wRR, regL * (NF + 1), xL)
+float evRS = f_dot(wRG, 0, xS) + f_dot(wRR, regS * (NF + 1), xS)
+float evLong = math.min(evPL, evRL)
+float evShort = math.min(evPS, evRS)
+
+// Queue regime-qualified candidates (de-duplicated) with a feasible initial stop.
+var int lastQueueL = na
+var int lastQueueS = na
+if barstate.isconfirmed and array.size(pend) < 150
+    if candLong and longStopOK and (na(lastQueueL) or bar_index - lastQueueL > dedupeBars)
+        lastQueueL := bar_index
+        array.push(pend, Pending.new(startBar = bar_index, dir = 1, risk = riskLong, entry = float(na), reg = regL,
+             stage = 0, remain = 1.0, realised = 0.0, pRaw = pRawL, cost = costRLong, x = array.copy(xL)))
+    if candShort and shortStopOK and (na(lastQueueS) or bar_index - lastQueueS > dedupeBars) and array.size(pend) < 150
+        lastQueueS := bar_index
+        array.push(pend, Pending.new(startBar = bar_index, dir = -1, risk = riskShort, entry = float(na), reg = regS,
+             stage = 0, remain = 1.0, realised = 0.0, pRaw = pRawS, cost = costRShort, x = array.copy(xS)))
+
+// ── Trade filter: calibrated P, ensemble EV, and operational gates ────
+var int lastEntryBar = na
+bool modelReady = trained >= minLabels
+bool oosOK = learnMode == "Walk-forward" or time_close >= trainingCutoff
+bool operationalOK = barstate.isconfirmed and modelReady and oosOK and dailyRiskOK and ddOK and
+     entriesToday < maxTradesDay and strategy.position_size == 0 and
+     (na(lastEntryBar) or bar_index - lastEntryBar > cooldown)
+
+float pv = math.max(syminfo.pointvalue, 0.000001)
+float maxUnits = strategy.equity * maxLeverage / math.max(close * pv, 0.000001)
+float multL = (confScale ? f_clip(evLong / evRef, 0.5, 1.5) : 1.0) * ddScale
+float multS = (confScale ? f_clip(evShort / evRef, 0.5, 1.5) : 1.0) * ddScale
+float unitsLong = math.floor(math.min(strategy.equity * riskPct / 100.0 * multL / math.max(riskLong * pv, 0.000001), maxUnits) / qtyStep) * qtyStep
+float unitsShort = math.floor(math.min(strategy.equity * riskPct / 100.0 * multS / math.max(riskShort * pv, 0.000001), maxUnits) / qtyStep) * qtyStep
+bool enterLong = operationalOK and candLong and not candShort and longStopOK and costRLong <= maxCostR and
+     roomLong >= minRoomR and unitsLong >= qtyStep and pCalL >= minProbability and evLong >= minExpectedR
+bool enterShort = operationalOK and candShort and not candLong and shortStopOK and costRShort <= maxCostR and
+     roomShort >= minRoomR and unitsShort >= qtyStep and pCalS >= minProbability and evShort >= minExpectedR
+
+var float tradeSL = na
+var float tradeTP1 = na
+var float tradeTP2 = na
+var float tradeTP3 = na
+var float tradeRiskDistance = na
+var int tradeSignalBar = na
+var float tradeQty = na
+var float tradeQ2 = na
+var float tradeQ3 = na
+var bool tradeBeDone = true
+// Market orders fill on the next available tick, usually next bar open.
+// The relative exits below attach to the actual fill price rather than signal close.
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    tradeSL := na
+    tradeTP1 := na
+    tradeTP2 := na
+    tradeTP3 := na
+    tradeRiskDistance := na
+    tradeSignalBar := na
+    tradeQty := na
+    tradeBeDone := true
+if strategy.position_size > 0 and strategy.position_size[1] == 0 and not na(tradeRiskDistance)
+    tradeSL := strategy.position_avg_price - tradeRiskDistance
+    tradeTP1 := strategy.position_avg_price + tradeRiskDistance
+    tradeTP2 := strategy.position_avg_price + 2.0 * tradeRiskDistance
+    tradeTP3 := strategy.position_avg_price + 3.0 * tradeRiskDistance
+if strategy.position_size < 0 and strategy.position_size[1] == 0 and not na(tradeRiskDistance)
+    tradeSL := strategy.position_avg_price + tradeRiskDistance
+    tradeTP1 := strategy.position_avg_price - tradeRiskDistance
+    tradeTP2 := strategy.position_avg_price - 2.0 * tradeRiskDistance
+    tradeTP3 := strategy.position_avg_price - 3.0 * tradeRiskDistance
+
+// Break-even: once the TP1 leg has filled (position shrank), re-issue the remaining legs with stop at entry.
+if not tradeBeDone and not na(tradeQty) and strategy.position_size != 0 and
+     math.abs(strategy.position_size) <= tradeQty - qtyStep * 0.5
+    tradeBeDone := true
+    tradeSL := strategy.position_avg_price
+    if strategy.position_size > 0
+        if tradeQ2 >= qtyStep
+            strategy.exit("L-TP2", from_entry="L", qty=tradeQ2, stop=strategy.position_avg_price, limit=tradeTP2,
+                 alert_message="LONG_EXIT_LEG2")
+        strategy.exit("L-TP3", from_entry="L", qty=tradeQ3, stop=strategy.position_avg_price, limit=tradeTP3,
+             alert_message="LONG_EXIT_LEG3")
+    else
+        if tradeQ2 >= qtyStep
+            strategy.exit("S-TP2", from_entry="S", qty=tradeQ2, stop=strategy.position_avg_price, limit=tradeTP2,
+                 alert_message="SHORT_EXIT_LEG2")
+        strategy.exit("S-TP3", from_entry="S", qty=tradeQ3, stop=strategy.position_avg_price, limit=tradeTP3,
+             alert_message="SHORT_EXIT_LEG3")
+
+if enterLong
+    float q1 = math.floor(unitsLong * 0.25 / qtyStep) * qtyStep
+    float q2 = math.floor(unitsLong * 0.50 / qtyStep) * qtyStep
+    float q3 = math.max(unitsLong - q1 - q2, qtyStep)
+    tradeRiskDistance := riskLong
+    tradeSL := close - riskLong
+    tradeTP1 := close + riskLong
+    tradeTP2 := close + 2.0 * riskLong
+    tradeTP3 := close + 3.0 * riskLong
+    tradeSignalBar := bar_index
+    tradeQty := unitsLong
+    tradeQ2 := q2
+    tradeQ3 := q3
+    tradeBeDone := q1 < qtyStep
+    lastEntryBar := bar_index
+    entriesToday += 1
+    string message = "{\"event\":\"LONG_ENTRY\",\"ticker\":\"" + syminfo.ticker +
+         "\",\"p_cal\":" + str.tostring(pCalL, "#.####") + ",\"ev_r\":" + str.tostring(evLong, "#.###") +
+         ",\"indicative_signal_close_sl\":" + str.tostring(tradeSL, format.mintick) + ",\"risk_ticks\":" + str.tostring(ticksLong) + "}"
+    strategy.entry("L", strategy.long, qty=unitsLong, alert_message=message)
+    if q1 >= qtyStep
+        strategy.exit("L-TP1", from_entry="L", qty=q1, loss=ticksLong, profit=ticksLong, alert_message="LONG_EXIT_LEG1")
+    if q2 >= qtyStep
+        strategy.exit("L-TP2", from_entry="L", qty=q2, loss=ticksLong, profit=2 * ticksLong, alert_message="LONG_EXIT_LEG2")
+    strategy.exit("L-TP3", from_entry="L", qty=q3, loss=ticksLong, profit=3 * ticksLong, alert_message="LONG_EXIT_LEG3")
+if enterShort
+    float q1 = math.floor(unitsShort * 0.25 / qtyStep) * qtyStep
+    float q2 = math.floor(unitsShort * 0.50 / qtyStep) * qtyStep
+    float q3 = math.max(unitsShort - q1 - q2, qtyStep)
+    tradeRiskDistance := riskShort
+    tradeSL := close + riskShort
+    tradeTP1 := close - riskShort
+    tradeTP2 := close - 2.0 * riskShort
+    tradeTP3 := close - 3.0 * riskShort
+    tradeSignalBar := bar_index
+    tradeQty := unitsShort
+    tradeQ2 := q2
+    tradeQ3 := q3
+    tradeBeDone := q1 < qtyStep
+    lastEntryBar := bar_index
+    entriesToday += 1
+    string message = "{\"event\":\"SHORT_ENTRY\",\"ticker\":\"" + syminfo.ticker +
+         "\",\"p_cal\":" + str.tostring(pCalS, "#.####") + ",\"ev_r\":" + str.tostring(evShort, "#.###") +
+         ",\"indicative_signal_close_sl\":" + str.tostring(tradeSL, format.mintick) + ",\"risk_ticks\":" + str.tostring(ticksShort) + "}"
+    strategy.entry("S", strategy.short, qty=unitsShort, alert_message=message)
+    if q1 >= qtyStep
+        strategy.exit("S-TP1", from_entry="S", qty=q1, loss=ticksShort, profit=ticksShort, alert_message="SHORT_EXIT_LEG1")
+    if q2 >= qtyStep
+        strategy.exit("S-TP2", from_entry="S", qty=q2, loss=ticksShort, profit=2 * ticksShort, alert_message="SHORT_EXIT_LEG2")
+    strategy.exit("S-TP3", from_entry="S", qty=q3, loss=ticksShort, profit=3 * ticksShort, alert_message="SHORT_EXIT_LEG3")
+
+// Time exit and end-of-session flat: a live position is not allowed to run indefinitely.
+if strategy.position_size > 0 and not na(tradeSignalBar) and bar_index - tradeSignalBar >= horizon
+    strategy.close("L", comment="Time exit", alert_message="LONG_TIME_EXIT")
+if strategy.position_size < 0 and not na(tradeSignalBar) and bar_index - tradeSignalBar >= horizon
+    strategy.close("S", comment="Time exit", alert_message="SHORT_TIME_EXIT")
+if flattenOnClose and not sessionOK and strategy.position_size != 0
+    strategy.close_all(comment="Session end", alert_message="SESSION_FLAT")
+
+// ── Visual presentation ──────────────────────────────────────────────
+plot(emaFast, "EMA 9", color=color.new(color.teal, 0), linewidth=1)
+plot(emaSlow, "EMA 21", color=color.new(color.orange, 0), linewidth=1)
+// Do not show stale targets after a trade opened and exited inside one bar.
+bool showTradeLevels = strategy.position_size != 0 or (not na(tradeSignalBar) and tradeSignalBar == bar_index)
+plot(showTradeLevels ? tradeSL : na, "Planned SL / BE", color=color.red, style=plot.style_linebr, linewidth=2)
+plot(showTradeLevels ? tradeTP1 : na, "TP1 1R", color=color.new(color.lime, 60), style=plot.style_linebr)
+plot(showTradeLevels ? tradeTP2 : na, "TP2 2R", color=color.new(color.lime, 25), style=plot.style_linebr)
+plot(showTradeLevels ? tradeTP3 : na, "TP3 3R", color=color.lime, style=plot.style_linebr)
+plotshape(enterLong, title="Long setup", style=shape.labelup, location=location.belowbar,
+     color=color.new(color.green, 0), text="ML BUY", textcolor=color.white, size=size.tiny)
+plotshape(enterShort, title="Short setup", style=shape.labeldown, location=location.abovebar,
+     color=color.new(color.red, 0), text="ML SELL", textcolor=color.white, size=size.tiny)
+
+var table dash = table.new(position.top_right, 2, 13, border_width=1)
+if barstate.islast
+    color bg = color.new(color.black, 20)
+    color key = color.new(color.silver, 15)
+    string alignment = htfLong ? "15m+1H UP" : htfShort ? "15m+1H DOWN" : "MIXED"
+    string status = not sessionOK ? "OUT OF SESSION" : not newsOK ? "NEWS BLOCK" : inRelease ? "RELEASE WINDOW" :
+         not shockOK ? "SHOCK COOLDOWN" : not volumeOK ? "NO VOLUME DATA" : not modelReady ? "ML WARMUP" :
+         not dailyRiskOK ? "DAILY LOSS LIMIT" : not ddOK ? "DRAWDOWN HALT" :
+         entriesToday >= maxTradesDay ? "DAILY TRADE LIMIT" : not oosOK ? "TRAINING PERIOD" : "EVALUATING"
+    float baseRate = trained > 0 ? trainedWins / float(trained) : 0.0
+    float baseVar = baseRate * (1.0 - baseRate)
+    float skill = (not na(brier) and baseVar > 0) ? 1.0 - brier / baseVar : na
+    table.cell(dash, 0, 0, "XAU ML SCALPER v1.2", bgcolor=color.navy, text_color=color.white)
+    table.cell(dash, 1, 0, status, bgcolor=color.navy, text_color=color.white)
+    table.cell(dash, 0, 1, "Regime", bgcolor=key)
+    table.cell(dash, 1, 1, regime, bgcolor=bg, text_color=color.white)
+    table.cell(dash, 0, 2, "HTF trend", bgcolor=key)
+    table.cell(dash, 1, 2, alignment + " (" + str.tostring(htfStrength, "#.##") + ")", bgcolor=bg, text_color=color.white)
+    table.cell(dash, 0, 3, "ATR ratio / ADX", bgcolor=key)
+    table.cell(dash, 1, 3, str.tostring(atrRatio, "#.##") + " / " + str.tostring(adx, "#.0"), bgcolor=bg, text_color=color.white)
+    table.cell(dash, 0, 4, "Sentiment / Delta*", bgcolor=key)
+    table.cell(dash, 1, 4, str.tostring(sentiment, "#.##") + " / " + str.tostring(deltaScore, "#.##"), bgcolor=bg, text_color=color.white)
+    table.cell(dash, 0, 5, "Calibrated P long/short", bgcolor=key)
+    table.cell(dash, 1, 5, str.tostring(pCalL * 100, "#.0") + "% / " + str.tostring(pCalS * 100, "#.0") + "%", bgcolor=bg, text_color=color.white)
+    table.cell(dash, 0, 6, "Ensemble EV long/short", bgcolor=key)
+    table.cell(dash, 1, 6, str.tostring(evLong, "#.##") + "R / " + str.tostring(evShort, "#.##") + "R", bgcolor=bg, text_color=color.white)
+    table.cell(dash, 0, 7, "Labels / positive / base rate", bgcolor=key)
+    table.cell(dash, 1, 7, str.tostring(trained) + " / " + str.tostring(trainedWins) + " / " + str.tostring(baseRate * 100, "#.0") + "%", bgcolor=bg, text_color=color.white)
+    table.cell(dash, 0, 8, "Avg win / loss (net R)", bgcolor=key)
+    table.cell(dash, 1, 8, str.tostring(avgWinR, "#.##") + " / " + str.tostring(avgLossR, "#.##"), bgcolor=bg, text_color=color.white)
+    table.cell(dash, 0, 9, "Brier skill vs base rate", bgcolor=key)
+    table.cell(dash, 1, 9, na(skill) ? "n/a" : str.tostring(skill * 100, "#.0") + "%", bgcolor=bg, text_color=color.white)
+    table.cell(dash, 0, 10, "Entries today / DD from peak", bgcolor=key)
+    table.cell(dash, 1, 10, str.tostring(entriesToday) + " / " + str.tostring(maxTradesDay) + "  |  " + str.tostring(ddPct, "#.0") + "%", bgcolor=bg, text_color=color.white)
+    table.cell(dash, 0, 11, "Macro feeds", bgcolor=key)
+    table.cell(dash, 1, 11, macroStatus, bgcolor=bg, text_color=color.white)
+    table.cell(dash, 0, 12, "*Proxy, not order flow", bgcolor=color.new(color.orange, 10))
+    table.cell(dash, 1, 12, learnMode, bgcolor=bg, text_color=color.white)
