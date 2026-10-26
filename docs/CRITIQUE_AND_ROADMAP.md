@@ -45,10 +45,10 @@ Objective chosen: positive expectancy and profit factor, not raw win rate.
 | **Labels** | Each label is the realised net R of the actual ladder: 25% at 1R, 50% at 2R, 25% at 3R, break-even after TP1, time exit at market, and the sample's own cost subtracted. Ties resolve stop-first. |
 | **Break-even** | Live strategy re-issues the TP2 and TP3 legs with the stop at entry once the TP1 leg fills. |
 | **De-duplication** | At most one queued sample per side per `dedupeBars` (default 3). `minLabels` raised to 150. |
-| **Learners** | Two online learners: a logistic model for P(net R > 0) and an NLMS regression for expected R. Each is global weights plus per-regime deviations with stronger L2 on the regime part, so rare regimes borrow strength from the global fit. |
+| **Learners** | Two online learners: a logistic model for P(win), where a win means final net R of at least +0.5R (`winThresholdR`), so a TP1 partial followed by a break-even stop no longer counts as a win and an NLMS regression for expected R. Each is global weights plus per-regime deviations with stronger L2 on the regime part, so rare regimes borrow strength from the global fit. |
 | **Features** | 11 features: momentum, HTF trend strength in ATR units, confluence, z-scored macro, delta proxy, volatility state, ADX, room to the next major liquidity level in R, session quality, liquidity-pool quality (prior-day > Asia > swing) and candle close location. |
 | **Calibration** | Ten-bin online calibration of the logistic score, shrunk toward the raw score with 15 pseudo-counts. |
-| **EV** | Calibrated P combined with *empirical* average win and loss R (EV_p), and the regression EV. The gate uses `min(EV_p, EV_reg)`, so both models must agree. The p gate now defaults to 0.45 and is a floor, not the main filter. |
+| **EV** | Calibrated P combined with *empirical* average win and loss R (EV_p), and the regression EV. The gate uses `min(EV_p, EV_reg)`, so both models must agree. The p gate now defaults to 0.35 and is a floor, not the main filter. Average payoff of non-wins is tracked signed, because a break-even exit after TP1 is slightly positive. |
 | **Skill monitor** | A running Brier score versus base-rate variance is shown on the dashboard. A negative skill figure means the model is not adding information, and you should not trade it live. |
 | **Cost and room gates** | Skips trades where round-trip cost exceeds `maxCostR` (default 0.20R) or where a major level is closer than `minRoomR` (default 1R). |
 | **Risk** | Optional confidence-scaled sizing (0.5x–1.5x of base risk, from ensemble EV). A drawdown throttle halves risk at 5% from peak and halts at 10%. |
@@ -63,6 +63,12 @@ Objective chosen: positive expectancy and profit factor, not raw win rate.
 - Volume on spot and CFD gold is tick volume, so `deltaScore` is a weak proxy, not order flow.
 - Defaults (`minProbability`, `minExpectedR`, `maxCostR`, `minRoomR`, stop band) are reasoned starting points, not optimised values.
 - Strategy Tester `slippage` and `commission` in the `strategy()` header are fixed constants. Set them to your broker's real spread before reading any result.
+
+---
+
+### Dashboard (revised)
+
+The panel now shows the first blocking gate and what it is waiting for, what setup the current regime needs, whether a candidate exists, the P and expected-R values next to their thresholds, a tick/cross check for each long and short gate, and a model-skill row that says "NO EDGE YET" when the Brier skill is not positive. Position and text size are inputs (group 06).
 
 ---
 

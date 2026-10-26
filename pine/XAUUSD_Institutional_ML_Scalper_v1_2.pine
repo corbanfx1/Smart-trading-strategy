@@ -66,7 +66,8 @@ int horizon = input.int(12, "Label horizon / max hold, in 5m candles", minval=3,
 int minLabels = input.int(150, "Minimum matured ML labels before trading", minval=30, maxval=3000, group=G4)
 int dedupeBars = input.int(3, "Label de-duplication: min bars between queued samples (same side)", minval=0, maxval=24, group=G4)
 float learningRate = input.float(0.03, "SGD learning rate (decays with sample count)", minval=0.001, maxval=0.25, step=0.005, group=G4)
-float minProbability = input.float(0.45, "Minimum CALIBRATED P(net R > 0)", minval=0.20, maxval=0.90, step=0.01, group=G4)
+float winThresholdR = input.float(0.5, "A sample is a WIN only if its final net R is at least", minval=0.0, maxval=2.0, step=0.1, group=G4)
+float minProbability = input.float(0.35, "Minimum CALIBRATED P(win) (a floor; expected R is the main gate)", minval=0.10, maxval=0.90, step=0.01, group=G4)
 float minExpectedR = input.float(0.15, "Minimum ensemble expected R (net of cost)", minval=0.0, maxval=2.0, step=0.05, group=G4)
 float assumedCost = input.float(0.40, "Estimated round-trip execution cost (USD per oz)", minval=0.0, step=0.05, group=G4)
 float maxCostR = input.float(0.20, "Skip if cost / stop distance exceeds (R)", minval=0.02, maxval=1.0, step=0.01, group=G4)
@@ -84,6 +85,10 @@ int maxTradesDay = input.int(4, "Max entries per London calendar day", minval=1,
 float dailyMaxLoss = input.float(3.0, "Daily closed+open equity loss limit (%)", minval=0.5, maxval=10.0, step=0.5, group=G5)
 float ddHalfPct = input.float(5.0, "Equity drawdown from peak that HALVES risk (%)", minval=1.0, maxval=30.0, step=0.5, group=G5)
 float ddHaltPct = input.float(10.0, "Equity drawdown from peak that HALTS new entries (%)", minval=2.0, maxval=50.0, step=0.5, group=G5)
+
+string G6 = "06 | Dashboard"
+string dashPos = input.string("Top right", "Panel position", options=["Top right", "Top left", "Middle right", "Middle left", "Bottom right", "Bottom left"], group=G6)
+string dashSize = input.string("Small", "Panel text size", options=["Tiny", "Small", "Normal"], group=G6)
 int cooldown = input.int(3, "Minimum bars after last entry", minval=0, maxval=50, group=G5)
 
 // ── Constants ─────────────────────────────────────────────────────────
@@ -451,9 +456,9 @@ var binN = array.new<float>(10, 0.0)             // calibration: samples per sco
 var binW = array.new<float>(10, 0.0)             // calibration: positives per score bin
 var int trained = 0
 var int trainedWins = 0
-var float sumWinR = 16.0    // priors: 10 pseudo-wins averaging +1.6R, 10 pseudo-losses averaging -0.9R
+var float sumWinR = 16.0    // priors: 10 pseudo-wins averaging +1.6R, 10 non-wins averaging -0.6R (signed: partials count)
 var float nWinR = 10.0
-var float sumLossR = 9.0
+var float sumLossR = -6.0
 var float nLossR = 10.0
 var float brier = na
 var pend = array.new<Pending>()
@@ -497,7 +502,7 @@ if barstate.isconfirmed and array.size(pend) > 0
                 done := true
             if done
                 float netR = s.realised - s.cost
-                float y = netR > 0 ? 1.0 : 0.0
+                float y = netR >= winThresholdR ? 1.0 : 0.0
                 bool canLearn = learnMode == "Walk-forward" or time_close < trainingCutoff
                 if canLearn
                     int off = s.reg * (NF + 1)
@@ -522,7 +527,7 @@ if barstate.isconfirmed and array.size(pend) > 0
                         nWinR += 1.0
                         trainedWins += 1
                     else
-                        sumLossR += -netR
+                        sumLossR += netR
                         nLossR += 1.0
                     float e2 = (s.pRaw - y) * (s.pRaw - y)
                     brier := na(brier) ? e2 : brier * 0.98 + e2 * 0.02
@@ -531,7 +536,7 @@ if barstate.isconfirmed and array.size(pend) > 0
 
 // ── Features (all roughly in [-1, 1]; directional ones flip sign for shorts) ──
 float avgWinR = sumWinR / nWinR
-float avgLossR = sumLossR / nLossR
+float avgOtherR = sumLossR / nLossR   // signed mean net R of non-wins (can be slightly positive)
 float volFeat = f_clip((atrRatio - 1.0) / 0.5, -1.0, 1.0)
 float adxFeat = f_clip((adx - 20.0) / 20.0, -1.0, 1.0)
 float sessFeat = highQualitySession ? 1.0 : -0.5
@@ -561,8 +566,8 @@ float pRawS = f_sigmoid(f_dot(wCG, 0, xS) + f_dot(wCR, regS * (NF + 1), xS))
 float pCalL = f_calibrate(pRawL, binN, binW)
 float pCalS = f_calibrate(pRawS, binN, binW)
 // Two independent EV estimates; the trade needs BOTH, so use the smaller.
-float evPL = pCalL * avgWinR - (1.0 - pCalL) * avgLossR
-float evPS = pCalS * avgWinR - (1.0 - pCalS) * avgLossR
+float evPL = pCalL * avgWinR + (1.0 - pCalL) * avgOtherR
+float evPS = pCalS * avgWinR + (1.0 - pCalS) * avgOtherR
 float evRL = f_dot(wRG, 0, xL) + f_dot(wRR, regL * (NF + 1), xL)
 float evRS = f_dot(wRG, 0, xS) + f_dot(wRR, regS * (NF + 1), xS)
 float evLong = math.min(evPL, evRL)
@@ -667,7 +672,7 @@ if enterLong
     lastEntryBar := bar_index
     entriesToday += 1
     string message = "{\"event\":\"LONG_ENTRY\",\"ticker\":\"" + syminfo.ticker +
-         "\",\"p_cal\":" + str.tostring(pCalL, "#.####") + ",\"ev_r\":" + str.tostring(evLong, "#.###") +
+         "\",\"p_cal\":" + str.tostring(pCalL, "0.0000") + ",\"ev_r\":" + str.tostring(evLong, "0.000") +
          ",\"indicative_signal_close_sl\":" + str.tostring(tradeSL, format.mintick) + ",\"risk_ticks\":" + str.tostring(ticksLong) + "}"
     strategy.entry("L", strategy.long, qty=unitsLong, alert_message=message)
     if q1 >= qtyStep
@@ -692,7 +697,7 @@ if enterShort
     lastEntryBar := bar_index
     entriesToday += 1
     string message = "{\"event\":\"SHORT_ENTRY\",\"ticker\":\"" + syminfo.ticker +
-         "\",\"p_cal\":" + str.tostring(pCalS, "#.####") + ",\"ev_r\":" + str.tostring(evShort, "#.###") +
+         "\",\"p_cal\":" + str.tostring(pCalS, "0.0000") + ",\"ev_r\":" + str.tostring(evShort, "0.000") +
          ",\"indicative_signal_close_sl\":" + str.tostring(tradeSL, format.mintick) + ",\"risk_ticks\":" + str.tostring(ticksShort) + "}"
     strategy.entry("S", strategy.short, qty=unitsShort, alert_message=message)
     if q1 >= qtyStep
@@ -723,41 +728,88 @@ plotshape(enterLong, title="Long setup", style=shape.labelup, location=location.
 plotshape(enterShort, title="Short setup", style=shape.labeldown, location=location.abovebar,
      color=color.new(color.red, 0), text="ML SELL", textcolor=color.white, size=size.tiny)
 
-var table dash = table.new(position.top_right, 2, 13, border_width=1)
+f_tick(bool ok) => ok ? "✓" : "✗"
+
+float dashBaseRate = trained > 0 ? trainedWins / float(trained) : 0.0
+float dashBaseVar = dashBaseRate * (1.0 - dashBaseRate)
+float dashSkill = (not na(brier) and dashBaseVar > 0) ? 1.0 - brier / dashBaseVar : na
+string tblPosStr = dashPos == "Top left" ? position.top_left : dashPos == "Middle right" ? position.middle_right :
+     dashPos == "Middle left" ? position.middle_left : dashPos == "Bottom right" ? position.bottom_right :
+     dashPos == "Bottom left" ? position.bottom_left : position.top_right
+string txtSize = dashSize == "Tiny" ? size.tiny : dashSize == "Normal" ? size.normal : size.small
+
+var table dash = table.new(tblPosStr, 2, 17, border_width=1)
 if barstate.islast
     color bg = color.new(color.black, 20)
     color key = color.new(color.silver, 15)
-    string alignment = htfLong ? "15m+1H UP" : htfShort ? "15m+1H DOWN" : "MIXED"
+    color good = color.new(color.green, 35)
+    color bad = color.new(color.red, 35)
+    string alignment = htfLong ? "15m+1H UP" : htfShort ? "15m+1H DOWN" : "MIXED (no full agreement)"
+    // 1) The FIRST failing operational gate, and what it is waiting for.
     string status = not sessionOK ? "OUT OF SESSION" : not newsOK ? "NEWS BLOCK" : inRelease ? "RELEASE WINDOW" :
          not shockOK ? "SHOCK COOLDOWN" : not volumeOK ? "NO VOLUME DATA" : not modelReady ? "ML WARMUP" :
          not dailyRiskOK ? "DAILY LOSS LIMIT" : not ddOK ? "DRAWDOWN HALT" :
-         entriesToday >= maxTradesDay ? "DAILY TRADE LIMIT" : not oosOK ? "TRAINING PERIOD" : "EVALUATING"
-    float baseRate = trained > 0 ? trainedWins / float(trained) : 0.0
-    float baseVar = baseRate * (1.0 - baseRate)
-    float skill = (not na(brier) and baseVar > 0) ? 1.0 - brier / baseVar : na
-    table.cell(dash, 0, 0, "XAU ML SCALPER v1.2", bgcolor=color.navy, text_color=color.white)
-    table.cell(dash, 1, 0, status, bgcolor=color.navy, text_color=color.white)
-    table.cell(dash, 0, 1, "Regime", bgcolor=key)
-    table.cell(dash, 1, 1, regime, bgcolor=bg, text_color=color.white)
-    table.cell(dash, 0, 2, "HTF trend", bgcolor=key)
-    table.cell(dash, 1, 2, alignment + " (" + str.tostring(htfStrength, "#.##") + ")", bgcolor=bg, text_color=color.white)
-    table.cell(dash, 0, 3, "ATR ratio / ADX", bgcolor=key)
-    table.cell(dash, 1, 3, str.tostring(atrRatio, "#.##") + " / " + str.tostring(adx, "#.0"), bgcolor=bg, text_color=color.white)
-    table.cell(dash, 0, 4, "Sentiment / Delta*", bgcolor=key)
-    table.cell(dash, 1, 4, str.tostring(sentiment, "#.##") + " / " + str.tostring(deltaScore, "#.##"), bgcolor=bg, text_color=color.white)
-    table.cell(dash, 0, 5, "Calibrated P long/short", bgcolor=key)
-    table.cell(dash, 1, 5, str.tostring(pCalL * 100, "#.0") + "% / " + str.tostring(pCalS * 100, "#.0") + "%", bgcolor=bg, text_color=color.white)
-    table.cell(dash, 0, 6, "Ensemble EV long/short", bgcolor=key)
-    table.cell(dash, 1, 6, str.tostring(evLong, "#.##") + "R / " + str.tostring(evShort, "#.##") + "R", bgcolor=bg, text_color=color.white)
-    table.cell(dash, 0, 7, "Labels / positive / base rate", bgcolor=key)
-    table.cell(dash, 1, 7, str.tostring(trained) + " / " + str.tostring(trainedWins) + " / " + str.tostring(baseRate * 100, "#.0") + "%", bgcolor=bg, text_color=color.white)
-    table.cell(dash, 0, 8, "Avg win / loss (net R)", bgcolor=key)
-    table.cell(dash, 1, 8, str.tostring(avgWinR, "#.##") + " / " + str.tostring(avgLossR, "#.##"), bgcolor=bg, text_color=color.white)
-    table.cell(dash, 0, 9, "Brier skill vs base rate", bgcolor=key)
-    table.cell(dash, 1, 9, na(skill) ? "n/a" : str.tostring(skill * 100, "#.0") + "%", bgcolor=bg, text_color=color.white)
-    table.cell(dash, 0, 10, "Entries today / DD from peak", bgcolor=key)
-    table.cell(dash, 1, 10, str.tostring(entriesToday) + " / " + str.tostring(maxTradesDay) + "  |  " + str.tostring(ddPct, "#.0") + "%", bgcolor=bg, text_color=color.white)
-    table.cell(dash, 0, 11, "Macro feeds", bgcolor=key)
-    table.cell(dash, 1, 11, macroStatus, bgcolor=bg, text_color=color.white)
-    table.cell(dash, 0, 12, "*Proxy, not order flow", bgcolor=color.new(color.orange, 10))
-    table.cell(dash, 1, 12, learnMode, bgcolor=bg, text_color=color.white)
+         entriesToday >= maxTradesDay ? "DAILY TRADE LIMIT" : not oosOK ? "TRAINING PERIOD" : "ARMED - WATCHING FOR SETUP"
+    string statusDetail = not sessionOK ? "London " + londonHours + " (UK) / NY " + newYorkHours + " (ET)" :
+         not newsOK ? "manual news window active" : inRelease ? "08:30 / 14:00 ET data window" :
+         not shockOK ? "huge bar just printed; waiting " + str.tostring(shockCooldown) + " bars" :
+         not volumeOK ? "feed has no volume" :
+         not modelReady ? str.tostring(trained) + " of " + str.tostring(minLabels) + " training labels done" :
+         not dailyRiskOK ? "resumes next London day" : not ddOK ? "equity too far below peak" :
+         entriesToday >= maxTradesDay ? "resumes next London day" :
+         not oosOK ? "Frozen OOS: trading starts after cutoff" : "all operational gates open"
+    // 2) What the current regime needs before it can produce a candidate.
+    string needs = regime == "COMPRESSION" ? "liquidity sweep (PDH/PDL/Asia/swing) + strong rejection wick; HTF not opposed" :
+         regime == "TRANSITION" ? "BOS + displacement + fresh FVG + recent sweep; HTF fully aligned" :
+         regime == "EXPANSION" ? "BOS then FVG/OB retest above/below EMA9; HTF fully aligned" :
+         "RSI washout/blow-off + sweep + CHOCH; HTF not opposed"
+    string candTxt = candLong ? "LONG candidate" : candShort ? "SHORT candidate" : "none yet"
+    bool pOkL = pCalL >= minProbability
+    bool pOkS = pCalS >= minProbability
+    bool evOkL = evLong >= minExpectedR
+    bool evOkS = evShort >= minExpectedR
+    bool costOkL = costRLong <= maxCostR
+    bool costOkS = costRShort <= maxCostR
+    bool roomOkL = roomLong >= minRoomR
+    bool roomOkS = roomShort >= minRoomR
+    bool armed = status == "ARMED - WATCHING FOR SETUP"
+    table.cell(dash, 0, 0, "XAU ML SCALPER v1.2", bgcolor=color.navy, text_color=color.white, text_size=txtSize)
+    table.cell(dash, 1, 0, "STATUS", bgcolor=color.navy, text_color=color.white, text_size=txtSize)
+    table.cell(dash, 0, 1, "Now", bgcolor=key, text_size=txtSize)
+    table.cell(dash, 1, 1, status, bgcolor=armed ? good : color.new(color.orange, 10), text_color=color.white, text_size=txtSize)
+    table.cell(dash, 0, 2, "Waiting for", bgcolor=key, text_size=txtSize)
+    table.cell(dash, 1, 2, statusDetail, bgcolor=bg, text_color=color.white, text_size=txtSize)
+    table.cell(dash, 0, 3, "Regime", bgcolor=key, text_size=txtSize)
+    table.cell(dash, 1, 3, regime, bgcolor=bg, text_color=color.white, text_size=txtSize)
+    table.cell(dash, 0, 4, "Setup this regime needs", bgcolor=key, text_size=txtSize)
+    table.cell(dash, 1, 4, needs, bgcolor=bg, text_color=color.white, text_size=txtSize)
+    table.cell(dash, 0, 5, "Setup found?", bgcolor=key, text_size=txtSize)
+    table.cell(dash, 1, 5, candTxt, bgcolor=(candLong or candShort) ? good : bg, text_color=color.white, text_size=txtSize)
+    table.cell(dash, 0, 6, "HTF trend (-1 bear .. +1 bull)", bgcolor=key, text_size=txtSize)
+    table.cell(dash, 1, 6, alignment + "  " + str.tostring(htfStrength, "0.00"), bgcolor=bg, text_color=color.white, text_size=txtSize)
+    table.cell(dash, 0, 7, "Volatility ratio / ADX", bgcolor=key, text_size=txtSize)
+    table.cell(dash, 1, 7, str.tostring(atrRatio, "0.00") + " / " + str.tostring(adx, "0.0"), bgcolor=bg, text_color=color.white, text_size=txtSize)
+    table.cell(dash, 0, 8, "P(win) long / short  (need " + str.tostring(minProbability * 100, "0") + "%)", bgcolor=key, text_size=txtSize)
+    table.cell(dash, 1, 8, str.tostring(pCalL * 100, "0.0") + "% / " + str.tostring(pCalS * 100, "0.0") + "%", bgcolor=bg, text_color=color.white, text_size=txtSize)
+    table.cell(dash, 0, 9, "Expected R long / short  (need " + str.tostring(minExpectedR, "0.00") + ")", bgcolor=key, text_size=txtSize)
+    table.cell(dash, 1, 9, str.tostring(evLong, "0.00") + "R / " + str.tostring(evShort, "0.00") + "R", bgcolor=bg, text_color=color.white, text_size=txtSize)
+    table.cell(dash, 0, 10, "Long gates", bgcolor=key, text_size=txtSize)
+    table.cell(dash, 1, 10, "P " + f_tick(pOkL) + "  EV " + f_tick(evOkL) + "  cost " + f_tick(costOkL) + "  room " + f_tick(roomOkL),
+         bgcolor=(pOkL and evOkL and costOkL and roomOkL) ? good : bad, text_color=color.white, text_size=txtSize)
+    table.cell(dash, 0, 11, "Short gates", bgcolor=key, text_size=txtSize)
+    table.cell(dash, 1, 11, "P " + f_tick(pOkS) + "  EV " + f_tick(evOkS) + "  cost " + f_tick(costOkS) + "  room " + f_tick(roomOkS),
+         bgcolor=(pOkS and evOkS and costOkS and roomOkS) ? good : bad, text_color=color.white, text_size=txtSize)
+    table.cell(dash, 0, 12, "Labels done / wins / win rate", bgcolor=key, text_size=txtSize)
+    table.cell(dash, 1, 12, str.tostring(trained) + " / " + str.tostring(trainedWins) + " / " + str.tostring(dashBaseRate * 100, "0.0") + "%  (win = " + str.tostring(winThresholdR, "0.0") + "R+)",
+         bgcolor=bg, text_color=color.white, text_size=txtSize)
+    table.cell(dash, 0, 13, "Avg win / avg non-win (net R)", bgcolor=key, text_size=txtSize)
+    table.cell(dash, 1, 13, str.tostring(avgWinR, "0.00") + " / " + str.tostring(avgOtherR, "0.00"), bgcolor=bg, text_color=color.white, text_size=txtSize)
+    table.cell(dash, 0, 14, "Model skill vs base rate", bgcolor=key, text_size=txtSize)
+    table.cell(dash, 1, 14, na(dashSkill) ? "n/a (need labels)" : str.tostring(dashSkill * 100, "0.0") + "%  " + (dashSkill > 0 ? "has edge" : "NO EDGE YET"),
+         bgcolor=na(dashSkill) ? bg : dashSkill > 0 ? good : bad, text_color=color.white, text_size=txtSize)
+    table.cell(dash, 0, 15, "Entries today / drawdown from peak", bgcolor=key, text_size=txtSize)
+    table.cell(dash, 1, 15, str.tostring(entriesToday) + " of " + str.tostring(maxTradesDay) + "  /  " + str.tostring(ddPct, "0.0") + "%",
+         bgcolor=bg, text_color=color.white, text_size=txtSize)
+    table.cell(dash, 0, 16, "Sentiment / delta* / macro", bgcolor=color.new(color.orange, 10), text_size=txtSize)
+    table.cell(dash, 1, 16, str.tostring(sentiment, "0.00") + " / " + str.tostring(deltaScore, "0.00") + " / " + macroStatus + "  (*proxy, " + learnMode + ")",
+         bgcolor=bg, text_color=color.white, text_size=txtSize)
