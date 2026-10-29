@@ -213,11 +213,15 @@ vwapV  = ta.vwap(hlc3)
 volAvg = ta.sma(volume, 20)
 [diPlus, diMinus, adxVal] = ta.dmi(adxLen, adxLen)
 
+// Helper: nz-equivalent for booleans (Pine v6 nz() only accepts numeric types)
+nzb(bool b) =>
+    na(b) ? false : b
+
 // MACD signal crossovers
 bool macdBullCross = ta.crossover(macdLine, macdSig)
 bool macdBearCross = ta.crossunder(macdLine, macdSig)
-bool recentMacdBullX = macdBullCross or nz(macdBullCross[1]) or nz(macdBullCross[2])
-bool recentMacdBearX = macdBearCross or nz(macdBearCross[1]) or nz(macdBearCross[2])
+bool recentMacdBullX = macdBullCross or nzb(macdBullCross[1]) or nzb(macdBullCross[2])
+bool recentMacdBearX = macdBearCross or nzb(macdBearCross[1]) or nzb(macdBearCross[2])
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Volume intelligence (tick volume z-score & delta proxy)
@@ -236,7 +240,7 @@ bool deltaBear = not na(deltaSma) and deltaSma < 0
 // Institutional candle detection
 float bodyRatio = barRange > 0 ? bodySize / barRange : 1.0
 bool absorption = volZ >= absVolZ and bodyRatio <= absBodyMax and barRange > atrS * 0.3
-bool recentAbs = absorption or nz(absorption[1]) or nz(absorption[2])
+bool recentAbs = absorption or nzb(absorption[1]) or nzb(absorption[2])
 bool aggressiveBull = close > open and bodySize > atrS * 1.5 and volZ > 1.0
 bool aggressiveBear = close < open and bodySize > atrS * 1.5 and volZ > 1.0
 
@@ -636,7 +640,7 @@ float f7L = nz(adxVal) >= adxThresh + 10 ? 1.0 : nz(adxVal) >= adxThresh ? 0.7 :
 float f8L = na(ema50) ? 0.5 : close > ema50 ? 1.0 : 0.0
 float f9L = na(deltaSma) ? 0.5 : deltaBull ? 1.0 : 0.0
 float f10L = useDivFilter and recentBullDiv ? 1.0 : 0.0
-float f11L = math.min((recentStopHuntBull ? 0.5 : 0.0) + (recentAbs ? 0.3 : 0.0) + (aggressiveBull or nz(aggressiveBull[1]) ? 0.3 : 0.0), 1.0)
+float f11L = math.min((recentStopHuntBull ? 0.5 : 0.0) + (recentAbs ? 0.3 : 0.0) + (aggressiveBull or nzb(aggressiveBull[1]) ? 0.3 : 0.0), 1.0)
 float f12L = not intraday ? 0.5 : inKZ ? 1.0 : 0.3
 
 // ── SHORT factor scores ──
@@ -650,7 +654,7 @@ float f7S = f7L
 float f8S = na(ema50) ? 0.5 : close < ema50 ? 1.0 : 0.0
 float f9S = na(deltaSma) ? 0.5 : deltaBear ? 1.0 : 0.0
 float f10S = useDivFilter and recentBearDiv ? 1.0 : 0.0
-float f11S = math.min((recentStopHuntBear ? 0.5 : 0.0) + (recentAbs ? 0.3 : 0.0) + (aggressiveBear or nz(aggressiveBear[1]) ? 0.3 : 0.0), 1.0)
+float f11S = math.min((recentStopHuntBear ? 0.5 : 0.0) + (recentAbs ? 0.3 : 0.0) + (aggressiveBear or nzb(aggressiveBear[1]) ? 0.3 : 0.0), 1.0)
 float f12S = f12L
 
 // Weighted scores
@@ -697,7 +701,7 @@ bool pdShortOk = not usePdFlt or (not na(eqMid) and close > eqMid)
 float sigStop = na
 float sigTarget = na
 float minRisk = minStopAtr * atrS
-float sigConf = 0.0
+var float sigConf = 0.0
 string sigGrade = ""
 
 if showSig and tradeDir == 0 and kzOk and regimeOk
@@ -789,8 +793,11 @@ tblRow(table t, int r, string a, string b, color c) =>
     t.cell(1, r, b, text_color = c, text_halign = text.align_left, text_size = size.small)
 
 gauge(float s) =>
-    int n = math.round(s * 5)
-    str.repeat("|", n) + str.repeat(".", 5 - n)
+    int n = math.max(0, math.min(5, math.round(s * 5)))
+    string r = ""
+    for i = 0 to 4
+        r := r + (i < n ? "|" : ".")
+    r
 
 confRow(table t, int r, string a, float s) =>
     color c = s >= 0.7 ? color.green : s >= 0.4 ? color.yellow : color.red
