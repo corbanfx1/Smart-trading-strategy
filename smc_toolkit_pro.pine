@@ -1,0 +1,893 @@
+//@version=6
+indicator("SMC Toolkit Pro", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Inputs
+// ═══════════════════════════════════════════════════════════════════════════
+GRP_STRUCT = "Market structure"
+swingLen   = input.int(10, "Swing length", minval = 2, group = GRP_STRUCT)
+showStruct = input.bool(true, "Show BOS / CHoCH", group = GRP_STRUCT)
+showSweep  = input.bool(true, "Show liquidity sweeps", group = GRP_STRUCT)
+
+GRP_OB = "Order blocks"
+showOB   = input.bool(true, "Show order blocks", group = GRP_OB)
+obMax    = input.int(5, "Max active per side", minval = 1, maxval = 20, group = GRP_OB)
+obBullCl = input.color(color.new(color.teal, 80), "Bullish OB", group = GRP_OB)
+obBearCl = input.color(color.new(color.red, 80), "Bearish OB", group = GRP_OB)
+
+GRP_FVG = "Fair value gaps"
+showFVG   = input.bool(true, "Show fair value gaps", group = GRP_FVG)
+fvgMinAtr = input.float(0.3, "Min gap size (x ATR)", minval = 0.0, step = 0.1, group = GRP_FVG)
+fvgMax    = input.int(8, "Max active per side", minval = 1, maxval = 30, group = GRP_FVG)
+fvgBullCl = input.color(color.new(color.green, 85), "Bullish FVG", group = GRP_FVG)
+fvgBearCl = input.color(color.new(color.orange, 85), "Bearish FVG", group = GRP_FVG)
+
+GRP_EQ = "Equal highs / lows"
+showEQ = input.bool(true, "Show EQH / EQL", group = GRP_EQ)
+eqTol  = input.float(0.1, "Tolerance (x ATR)", minval = 0.01, step = 0.05, group = GRP_EQ)
+
+GRP_ZONE = "Premium / Discount"
+showZones = input.bool(true, "Show premium / discount zones", group = GRP_ZONE)
+
+GRP_HTF = "Higher timeframe"
+showHtf     = input.bool(true, "Show HTF swing levels and bias", group = GRP_HTF)
+htfTf       = input.timeframe("240", "HTF", group = GRP_HTF)
+htfSwingLen = input.int(5, "HTF swing length", minval = 2, group = GRP_HTF)
+
+GRP_KZ = "Kill zones"
+showKZ  = input.bool(true, "Highlight kill zones (intraday only)", group = GRP_KZ)
+kzTz    = input.string("America/New_York", "Time zone", options = ["America/New_York", "Europe/London", "Etc/UTC"], group = GRP_KZ)
+kzAsia  = input.session("2000-0000", "Asia", group = GRP_KZ)
+kzLon   = input.session("0200-0500", "London", group = GRP_KZ)
+kzNy    = input.session("0700-1000", "New York AM", group = GRP_KZ)
+kzClose = input.session("1000-1200", "London close", group = GRP_KZ)
+kzAsiaOn  = input.bool(true, "Asia on", inline = "kz", group = GRP_KZ)
+kzLonOn   = input.bool(true, "London on", inline = "kz", group = GRP_KZ)
+kzNyOn    = input.bool(true, "NY AM on", inline = "kz2", group = GRP_KZ)
+kzCloseOn = input.bool(false, "London close on", inline = "kz2", group = GRP_KZ)
+
+GRP_LVL = "Previous day / week levels"
+showPD = input.bool(true, "Previous day high / low", group = GRP_LVL)
+showPW = input.bool(true, "Previous week high / low", group = GRP_LVL)
+pdCl   = input.color(color.new(color.blue, 0), "Day colour", group = GRP_LVL)
+pwCl   = input.color(color.new(color.purple, 0), "Week colour", group = GRP_LVL)
+
+GRP_SIG = "Entry signals"
+showSig   = input.bool(true, "Show entry signals", group = GRP_SIG)
+useHtfFlt = input.bool(true, "Require HTF bias to agree", group = GRP_SIG)
+useKzFlt  = input.bool(false, "Only trade inside kill zones", group = GRP_SIG)
+usePdFlt  = input.bool(true, "Longs in discount, shorts in premium", group = GRP_SIG)
+stopBuf   = input.float(0.25, "Stop buffer (x ATR14)", minval = 0.0, step = 0.05, group = GRP_SIG)
+tpMode    = input.string("Fixed RR", "Target mode", options = ["Fixed RR", "Swing liquidity"], group = GRP_SIG)
+rrTarget  = input.float(2.0, "Reward : risk", minval = 0.5, step = 0.25, group = GRP_SIG)
+reqSweep  = input.bool(false, "Require liquidity sweep before the zone formed", group = GRP_SIG)
+reqDisp   = input.bool(true, "Require displacement (strong breaking candle)", group = GRP_SIG)
+dispMult  = input.float(1.5, "Displacement body (x ATR14)", minval = 0.5, step = 0.1, group = GRP_SIG)
+minStopAtr = input.float(0.5, "Min stop distance (x ATR14, 0 = off)", minval = 0.0, step = 0.1, group = GRP_SIG)
+
+GRP_MOM = "Momentum confluence"
+useMom     = input.bool(true, "Require momentum confluence for signals", group = GRP_MOM)
+momFast    = input.int(9, "Fast EMA", minval = 2, group = GRP_MOM)
+momSlow    = input.int(21, "Slow EMA", minval = 3, group = GRP_MOM)
+showMomEma = input.bool(true, "Plot momentum EMAs", group = GRP_MOM)
+
+GRP_VOL = "Volume intelligence"
+showVolSpikes = input.bool(true, "Highlight volume spikes", group = GRP_VOL, tooltip = "Marks bars where tick volume is statistically unusual (z-score above threshold).")
+volZThresh    = input.float(2.0, "Spike z-score threshold", minval = 1.0, maxval = 4.0, step = 0.5, group = GRP_VOL)
+volMult       = input.float(1.0, "Volume vs 20-bar avg (x)", minval = 0.1, step = 0.1, group = GRP_VOL)
+
+GRP_INST = "Institutional footprint"
+showInst      = input.bool(true, "Detect institutional activity", group = GRP_INST, tooltip = "Identifies absorption candles (high volume + small body), stop-hunt reversals, and aggressive institutional candles.")
+absBodyMax    = input.float(0.35, "Absorption: max body ratio", minval = 0.1, maxval = 0.5, step = 0.05, group = GRP_INST)
+absVolZ       = input.float(1.5, "Absorption: min volume z-score", minval = 0.5, maxval = 3.0, step = 0.25, group = GRP_INST)
+
+GRP_ML = "Signal intelligence (ML)"
+minConf       = input.float(55.0, "Min confidence % for signals", minval = 20.0, maxval = 95.0, step = 5.0, group = GRP_ML, tooltip = "Bayesian confidence threshold. Signals below this are suppressed. Higher = fewer but better signals.")
+useAdaptive   = input.bool(true, "Adaptive weight learning", group = GRP_ML, tooltip = "Weights shift automatically based on recent trade outcomes: trending markets boost momentum factors, choppy markets boost structural factors.")
+useRegime     = input.bool(true, "ADX regime filter (block ranging markets)", group = GRP_ML)
+adxLen        = input.int(14, "ADX length", minval = 5, maxval = 50, group = GRP_ML)
+adxThresh     = input.float(20.0, "ADX trending threshold", minval = 10.0, maxval = 40.0, step = 2.0, group = GRP_ML)
+useDivFilter  = input.bool(true, "RSI divergence boost", group = GRP_ML, tooltip = "Boosts confidence when RSI divergence confirms the signal direction.")
+
+GRP_TM = "Trade management and panels"
+useTp1     = input.bool(true, "Take partial profit at TP1", group = GRP_TM)
+tp1R       = input.float(1.0, "TP1 (R)", minval = 0.25, step = 0.25, group = GRP_TM)
+tp1Pct     = input.float(50.0, "% of position closed at TP1", minval = 10.0, maxval = 90.0, step = 5.0, group = GRP_TM)
+beOnTp1    = input.bool(true, "Move stop to break-even after TP1", group = GRP_TM)
+showTradeP = input.bool(true, "Show trade panel", group = GRP_TM)
+showConf   = input.bool(true, "Show confidence panel", group = GRP_TM)
+showStats  = input.bool(true, "Show performance table", group = GRP_TM)
+
+bullCl = input.color(color.teal, "Bullish structure colour", group = "Colours")
+bearCl = input.color(color.red, "Bearish structure colour", group = "Colours")
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Types and state
+// ═══════════════════════════════════════════════════════════════════════════
+type Zone
+    box  bx
+    bool bull
+    int  born
+    bool used
+    bool swept
+    bool strong
+
+var array<Zone> obs  = array.new<Zone>()
+var array<Zone> fvgs = array.new<Zone>()
+
+var float swHigh = na
+var int   swHighBar = na
+var bool  swHighCrossed = false
+var bool  swHighSwept = false
+
+var float swLow = na
+var int   swLowBar = na
+var bool  swLowCrossed = false
+var bool  swLowSwept = false
+
+var int   trend = 0
+var int   lastSweepHighBar = na
+var int   lastSweepLowBar = na
+
+var float prevPh = na
+var int   prevPhBar = na
+var float prevPl = na
+var int   prevPlBar = na
+
+var box premBox = na
+var box discBox = na
+var line eqLine = na
+
+var int   tradeDir = 0
+var int   lastDir = 0
+var float tEntry = na
+var float tStop0 = na
+var float tCurStop = na
+var float tRisk = na
+var float tTp1 = na
+var float tTarget = na
+var float tRR = na
+var float tp1RAct = na
+var bool  tp1Hit = false
+var float realizedR = 0.0
+var int   tradeBars = 0
+var int   entryBar = na
+var float lastR = 0.0
+var string lastResult = ""
+var box   tpBox = na
+var box   slBox = na
+var line  tp1Ln = na
+var line  stopLn = na
+var int   wins = 0
+var int   losses = 0
+var int   scratches = 0
+var float totalR = 0.0
+var float grossWin = 0.0
+var float lossSum = 0.0
+var int   sumBars = 0
+var table tradeT = na
+var table confT = na
+
+var label pdhLb = na
+var label pdlLb = na
+var label pwhLb = na
+var label pwlLb = na
+var table stats = na
+
+// RSI divergence tracking
+var float prevRsiLow = na
+var float prevPriceLow = na
+var float prevRsiHigh = na
+var float prevPriceHigh = na
+var bool  recentBullDiv = false
+var bool  recentBearDiv = false
+var int   bullDivBar = na
+var int   bearDivBar = na
+
+// Stop-hunt reversal memory
+var bool  recentStopHuntBull = false
+var bool  recentStopHuntBear = false
+var int   shBullBar = na
+var int   shBearBar = na
+
+// Adaptive learning: exponential win rate
+var float expWinRate = 0.5
+
+// Confidence values persisted for panels
+var float lastConfLong = 0.5
+var float lastConfShort = 0.5
+var string lastGrade = ""
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Core indicator calculations
+// ═══════════════════════════════════════════════════════════════════════════
+atr = ta.atr(200)
+atrS = ta.atr(14)
+
+emaF   = ta.ema(close, momFast)
+emaS   = ta.ema(close, momSlow)
+ema50  = ta.ema(close, 50)
+rsiV   = ta.rsi(close, 14)
+[macdLine, macdSig, macdHist] = ta.macd(close, 12, 26, 9)
+vwapV  = ta.vwap(hlc3)
+volAvg = ta.sma(volume, 20)
+[diPlus, diMinus, adxVal] = ta.dmi(adxLen, adxLen)
+
+// MACD signal crossovers
+bool macdBullCross = ta.crossover(macdLine, macdSig)
+bool macdBearCross = ta.crossunder(macdLine, macdSig)
+bool recentMacdBullX = macdBullCross or nz(macdBullCross[1]) or nz(macdBullCross[2])
+bool recentMacdBearX = macdBearCross or nz(macdBearCross[1]) or nz(macdBearCross[2])
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Volume intelligence (tick volume z-score & delta proxy)
+// ═══════════════════════════════════════════════════════════════════════════
+float volStd20 = ta.stdev(volume, 20)
+float volZ = (na(volume) or na(volStd20) or na(volAvg) or volStd20 == 0) ? 0.0 : (volume - volAvg) / volStd20
+bool volOk = na(volume) or na(volAvg) or volAvg == 0 or volume > volAvg * volMult
+
+float barRange = high - low
+float bodySize = math.abs(close - open)
+float deltaProxy = (na(volume) or barRange == 0) ? 0.0 : (2.0 * close - high - low) / barRange * volume
+float deltaSma = ta.sma(deltaProxy, 10)
+bool deltaBull = not na(deltaSma) and deltaSma > 0
+bool deltaBear = not na(deltaSma) and deltaSma < 0
+
+// Institutional candle detection
+float bodyRatio = barRange > 0 ? bodySize / barRange : 1.0
+bool absorption = volZ >= absVolZ and bodyRatio <= absBodyMax and barRange > atrS * 0.3
+bool recentAbs = absorption or nz(absorption[1]) or nz(absorption[2])
+bool aggressiveBull = close > open and bodySize > atrS * 1.5 and volZ > 1.0
+bool aggressiveBear = close < open and bodySize > atrS * 1.5 and volZ > 1.0
+
+// Visual markers
+bgcolor(showVolSpikes and volZ >= volZThresh ? color.new(color.yellow, 92) : na, title = "Volume spike zone")
+plotshape(showInst and absorption, "Absorption", shape.diamond, location.belowbar, color.new(color.fuchsia, 30), size = size.tiny)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════════════════
+trimZones(array<Zone> zones, bool bull, int maxPerSide) =>
+    int count = 0
+    if zones.size() > 0
+        for i = zones.size() - 1 to 0
+            Zone z = zones.get(i)
+            if z.bull == bull
+                count += 1
+                if count > maxPerSide
+                    z.bx.delete()
+                    zones.remove(i)
+                    true
+    true
+
+updateZones(array<Zone> zones) =>
+    if zones.size() > 0
+        for i = zones.size() - 1 to 0
+            Zone z = zones.get(i)
+            bool dead = z.bull ? close < z.bx.get_bottom() : close > z.bx.get_top()
+            if dead
+                z.bx.delete()
+                zones.remove(i)
+                true
+            else
+                z.bx.set_right(bar_index)
+                true
+    true
+
+touchZone(array<Zone> zones, bool bull, bool needSweep, bool needDisp, float minRisk) =>
+    float ref = na
+    if zones.size() > 0
+        for i = 0 to zones.size() - 1
+            Zone z = zones.get(i)
+            if z.bull == bull and not z.used and bar_index > z.born and (not needSweep or z.swept) and (not needDisp or z.strong)
+                float t = z.bx.get_top()
+                float b = z.bx.get_bottom()
+                bool hit = bull ? (low <= t and close > b and close > open) : (high >= b and close < t and close < open)
+                float risk = bull ? close - (b - atrS * stopBuf) : (t + atrS * stopBuf) - close
+                if hit and risk >= minRisk
+                    z.used := true
+                    ref := bull ? b : t
+                    break
+    ref
+
+htfStructure(int len) =>
+    float hp = ta.pivothigh(high, len, len)
+    float lp = ta.pivotlow(low, len, len)
+    var float h = na
+    var float l = na
+    var bool hc = false
+    var bool lc = false
+    var int t = 0
+    if not na(hp)
+        h := hp
+        hc := false
+    if not na(lp)
+        l := lp
+        lc := false
+    if not na(h) and not hc and close > h
+        hc := true
+        t := 1
+    if not na(l) and not lc and close < l
+        lc := true
+        t := -1
+    [t, h, l]
+
+levelLabel(label lb, float y, string txt, color c) =>
+    label out = lb
+    if not na(y)
+        if na(lb)
+            out := label.new(bar_index + 3, y, txt, style = label.style_label_left, color = color.new(c, 100), textcolor = c, size = size.small)
+        else
+            lb.set_xy(bar_index + 3, y)
+            out := lb
+    out
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Swing detection
+// ═══════════════════════════════════════════════════════════════════════════
+ph = ta.pivothigh(high, swingLen, swingLen)
+pl = ta.pivotlow(low, swingLen, swingLen)
+
+if not na(ph)
+    if showEQ and not na(prevPh) and math.abs(ph - prevPh) <= atr * eqTol
+        line.new(prevPhBar, prevPh, bar_index - swingLen, ph, color = bearCl, style = line.style_dotted)
+        label.new(math.round(math.avg(prevPhBar, bar_index - swingLen)), ph, "EQH", style = label.style_label_down, color = color.new(bearCl, 100), textcolor = bearCl, size = size.tiny)
+    prevPh := ph
+    prevPhBar := bar_index - swingLen
+    swHigh := ph
+    swHighBar := bar_index - swingLen
+    swHighCrossed := false
+    swHighSwept := false
+
+if not na(pl)
+    if showEQ and not na(prevPl) and math.abs(pl - prevPl) <= atr * eqTol
+        line.new(prevPlBar, prevPl, bar_index - swingLen, pl, color = bullCl, style = line.style_dotted)
+        label.new(math.round(math.avg(prevPlBar, bar_index - swingLen)), pl, "EQL", style = label.style_label_up, color = color.new(bullCl, 100), textcolor = bullCl, size = size.tiny)
+    prevPl := pl
+    prevPlBar := bar_index - swingLen
+    swLow := pl
+    swLowBar := bar_index - swingLen
+    swLowCrossed := false
+    swLowSwept := false
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Structure breaks
+// ═══════════════════════════════════════════════════════════════════════════
+bool bullBOS = false
+bool bearBOS = false
+bool bullCHoCH = false
+bool bearCHoCH = false
+bool sweepHigh = false
+bool sweepLow = false
+
+bool bullBreak = not na(swHigh) and not swHighCrossed and close > swHigh
+bool bearBreak = not na(swLow) and not swLowCrossed and close < swLow
+
+if bullBreak
+    bool isChoch = trend == -1
+    if isChoch
+        bullCHoCH := true
+    else
+        bullBOS := true
+    if showStruct
+        line.new(swHighBar, swHigh, bar_index, swHigh, color = bullCl)
+        label.new(math.round(math.avg(swHighBar, bar_index)), swHigh, isChoch ? "CHoCH" : "BOS", style = label.style_label_down, color = color.new(bullCl, 100), textcolor = bullCl, size = size.tiny)
+    if showOB and not na(swLowBar)
+        int n = math.min(bar_index - swLowBar, 400)
+        int org = 0
+        float obBody = 0.0
+        for i = 0 to n
+            obBody := math.max(obBody, math.abs(close[i] - open[i]))
+            if low[i] < low[org]
+                org := i
+        int idx = org
+        for i = org to math.min(org + 5, bar_index)
+            if close[i] < open[i]
+                idx := i
+                break
+        obs.push(Zone.new(box.new(bar_index - idx, high[idx], bar_index, low[idx], border_color = color.new(obBullCl, 40), bgcolor = obBullCl), true, bar_index, false, (not na(lastSweepLowBar) and lastSweepLowBar <= bar_index and lastSweepLowBar >= swLowBar - swingLen), obBody >= dispMult * atrS))
+        trimZones(obs, true, obMax)
+    swHighCrossed := true
+    trend := 1
+
+if bearBreak
+    bool isChoch = trend == 1
+    if isChoch
+        bearCHoCH := true
+    else
+        bearBOS := true
+    if showStruct
+        line.new(swLowBar, swLow, bar_index, swLow, color = bearCl)
+        label.new(math.round(math.avg(swLowBar, bar_index)), swLow, isChoch ? "CHoCH" : "BOS", style = label.style_label_up, color = color.new(bearCl, 100), textcolor = bearCl, size = size.tiny)
+    if showOB and not na(swHighBar)
+        int n = math.min(bar_index - swHighBar, 400)
+        int org = 0
+        float obBody = 0.0
+        for i = 0 to n
+            obBody := math.max(obBody, math.abs(close[i] - open[i]))
+            if high[i] > high[org]
+                org := i
+        int idx = org
+        for i = org to math.min(org + 5, bar_index)
+            if close[i] > open[i]
+                idx := i
+                break
+        obs.push(Zone.new(box.new(bar_index - idx, high[idx], bar_index, low[idx], border_color = color.new(obBearCl, 40), bgcolor = obBearCl), false, bar_index, false, (not na(lastSweepHighBar) and lastSweepHighBar <= bar_index and lastSweepHighBar >= swHighBar - swingLen), obBody >= dispMult * atrS))
+        trimZones(obs, false, obMax)
+    swLowCrossed := true
+    trend := -1
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Liquidity sweeps (enhanced with volume confirmation)
+// ═══════════════════════════════════════════════════════════════════════════
+if not na(swHigh) and not swHighCrossed and not swHighSwept and high > swHigh and close < swHigh
+    sweepHigh := true
+    swHighSwept := true
+    lastSweepHighBar := bar_index
+    if showSweep
+        string sweepTxt = volZ >= 1.0 ? "Sweep ⚡" : "Sweep"
+        label.new(bar_index, high, sweepTxt, style = label.style_label_down, color = color.new(bearCl, 100), textcolor = bearCl, size = size.tiny)
+
+if not na(swLow) and not swLowCrossed and not swLowSwept and low < swLow and close > swLow
+    sweepLow := true
+    swLowSwept := true
+    lastSweepLowBar := bar_index
+    if showSweep
+        string sweepTxt = volZ >= 1.0 ? "Sweep ⚡" : "Sweep"
+        label.new(bar_index, low, sweepTxt, style = label.style_label_up, color = color.new(bullCl, 100), textcolor = bullCl, size = size.tiny)
+
+// Stop-hunt reversal detection (sweep + volume + reversal close)
+if sweepLow and volZ >= 1.0 and close > open and close > (high + low) / 2.0
+    recentStopHuntBull := true
+    shBullBar := bar_index
+if sweepHigh and volZ >= 1.0 and close < open and close < (high + low) / 2.0
+    recentStopHuntBear := true
+    shBearBar := bar_index
+if not na(shBullBar) and bar_index - shBullBar > 15
+    recentStopHuntBull := false
+if not na(shBearBar) and bar_index - shBearBar > 15
+    recentStopHuntBear := false
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RSI divergence detection
+// ═══════════════════════════════════════════════════════════════════════════
+float rsiPl5 = ta.pivotlow(rsiV, 5, 5)
+float rsiPh5 = ta.pivothigh(rsiV, 5, 5)
+
+if not na(rsiPl5)
+    if not na(prevRsiLow) and rsiPl5 > prevRsiLow and low[5] < prevPriceLow
+        recentBullDiv := true
+        bullDivBar := bar_index
+    prevRsiLow := rsiPl5
+    prevPriceLow := low[5]
+
+if not na(rsiPh5)
+    if not na(prevRsiHigh) and rsiPh5 < prevRsiHigh and high[5] > prevPriceHigh
+        recentBearDiv := true
+        bearDivBar := bar_index
+    prevRsiHigh := rsiPh5
+    prevPriceHigh := high[5]
+
+if not na(bullDivBar) and bar_index - bullDivBar > 20
+    recentBullDiv := false
+if not na(bearDivBar) and bar_index - bearDivBar > 20
+    recentBearDiv := false
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Fair value gaps
+// ═══════════════════════════════════════════════════════════════════════════
+if showFVG and bar_index >= 2
+    if low > high[2] and close[1] > high[2] and (low - high[2]) > atr * fvgMinAtr
+        fvgs.push(Zone.new(box.new(bar_index - 2, low, bar_index, high[2], border_color = na, bgcolor = fvgBullCl), true, bar_index, false, (not na(lastSweepLowBar) and bar_index - lastSweepLowBar <= swingLen * 3), math.abs(close[1] - open[1]) >= dispMult * atrS))
+        trimZones(fvgs, true, fvgMax)
+    if high < low[2] and close[1] < low[2] and (low[2] - high) > atr * fvgMinAtr
+        fvgs.push(Zone.new(box.new(bar_index - 2, low[2], bar_index, high, border_color = na, bgcolor = fvgBearCl), false, bar_index, false, (not na(lastSweepHighBar) and bar_index - lastSweepHighBar <= swingLen * 3), math.abs(close[1] - open[1]) >= dispMult * atrS))
+        trimZones(fvgs, false, fvgMax)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Higher timeframe overlay
+// ═══════════════════════════════════════════════════════════════════════════
+bool htfActive = showHtf and timeframe.in_seconds(htfTf) > timeframe.in_seconds()
+[htfTrendRaw, htfHighRaw, htfLowRaw] = request.security(syminfo.tickerid, htfTf, htfStructure(htfSwingLen))
+int htfTrend = nz(htfTrendRaw)
+
+plot(htfActive ? htfHighRaw : na, "HTF swing high", color = color.new(color.red, 30), linewidth = 2, style = plot.style_linebr)
+plot(htfActive ? htfLowRaw : na, "HTF swing low", color = color.new(color.green, 30), linewidth = 2, style = plot.style_linebr)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Kill zones
+// ═══════════════════════════════════════════════════════════════════════════
+bool intraday = timeframe.isintraday
+bool inAsia = kzAsiaOn and intraday and not na(time(timeframe.period, kzAsia, kzTz))
+bool inLon = kzLonOn and intraday and not na(time(timeframe.period, kzLon, kzTz))
+bool inNy = kzNyOn and intraday and not na(time(timeframe.period, kzNy, kzTz))
+bool inClose = kzCloseOn and intraday and not na(time(timeframe.period, kzClose, kzTz))
+bool inKZ = inAsia or inLon or inNy or inClose
+
+bgcolor(showKZ and inAsia ? color.new(color.gray, 90) : na, title = "Asia kill zone")
+bgcolor(showKZ and inLon ? color.new(color.blue, 90) : na, title = "London kill zone")
+bgcolor(showKZ and inNy ? color.new(color.orange, 90) : na, title = "New York kill zone")
+bgcolor(showKZ and inClose ? color.new(color.purple, 90) : na, title = "London close kill zone")
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Previous day / week high and low
+// ═══════════════════════════════════════════════════════════════════════════
+float pdh = request.security(syminfo.tickerid, "D", high[1], lookahead = barmerge.lookahead_on)
+float pdl = request.security(syminfo.tickerid, "D", low[1], lookahead = barmerge.lookahead_on)
+float pwh = request.security(syminfo.tickerid, "W", high[1], lookahead = barmerge.lookahead_on)
+float pwl = request.security(syminfo.tickerid, "W", low[1], lookahead = barmerge.lookahead_on)
+
+bool dayOk = showPD and timeframe.in_seconds() < 86400
+bool weekOk = showPW and timeframe.in_seconds() < 604800
+
+plot(dayOk ? pdh : na, "PDH", color = pdCl, linewidth = 1, style = plot.style_linebr)
+plot(dayOk ? pdl : na, "PDL", color = pdCl, linewidth = 1, style = plot.style_linebr)
+plot(weekOk ? pwh : na, "PWH", color = pwCl, linewidth = 1, style = plot.style_linebr)
+plot(weekOk ? pwl : na, "PWL", color = pwCl, linewidth = 1, style = plot.style_linebr)
+
+if barstate.islast
+    if dayOk
+        pdhLb := levelLabel(pdhLb, pdh, "PDH", pdCl)
+        pdlLb := levelLabel(pdlLb, pdl, "PDL", pdCl)
+    if weekOk
+        pwhLb := levelLabel(pwhLb, pwh, "PWH", pwCl)
+        pwlLb := levelLabel(pwlLb, pwl, "PWL", pwCl)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Trade management: resolve the open trade
+// ═══════════════════════════════════════════════════════════════════════════
+fmtR(float x) =>
+    (x >= 0 ? "+" : "") + str.tostring(x, "#.##") + "R"
+
+bool tradeWin = false
+bool tradeLoss = false
+bool tp1Event = false
+bool longSig = false
+bool shortSig = false
+float tp1Frac = useTp1 ? tp1Pct / 100.0 : 0.0
+float ewrAlpha = 0.15
+
+if tradeDir != 0 and bar_index > entryBar
+    tradeBars += 1
+    int dir = tradeDir
+    bool stopHit = dir == 1 ? low <= tCurStop : high >= tCurStop
+    bool tp1Reach = useTp1 and not tp1Hit and (dir == 1 ? high >= tTp1 : low <= tTp1)
+    bool tp2Reach = dir == 1 ? high >= tTarget : low <= tTarget
+    bool closed = false
+    float finalR = 0.0
+    float exitPx = na
+    string result = ""
+    if stopHit
+        float stopR = (dir == 1 ? tCurStop - tEntry : tEntry - tCurStop) / tRisk
+        finalR := realizedR + (1.0 - (tp1Hit ? tp1Frac : 0.0)) * stopR
+        exitPx := tCurStop
+        result := finalR > 0.001 ? "Stopped in profit" : finalR < -0.001 ? "Stop" : "Break-even"
+        closed := true
+    else
+        if tp1Reach
+            tp1Hit := true
+            tp1Event := true
+            realizedR += tp1Frac * tp1RAct
+            label.new(bar_index, tTp1, "TP1 " + fmtR(tp1RAct), style = dir == 1 ? label.style_label_down : label.style_label_up, color = color.new(bullCl, 100), textcolor = bullCl, size = size.tiny)
+            if beOnTp1
+                stopLn.set_style(line.style_dotted)
+                tCurStop := tEntry
+                stopLn := line.new(bar_index, tCurStop, bar_index + 1, tCurStop, color = color.red)
+        if tp2Reach
+            finalR := realizedR + (1.0 - (tp1Hit ? tp1Frac : 0.0)) * tRR
+            exitPx := tTarget
+            result := "TP2"
+            closed := true
+    tpBox.set_right(bar_index)
+    slBox.set_right(bar_index)
+    tp1Ln.set_x2(bar_index)
+    stopLn.set_x2(bar_index)
+    if closed
+        lastR := finalR
+        lastResult := result
+        totalR += finalR
+        sumBars += tradeBars
+        if finalR > 0.001
+            wins += 1
+            grossWin += finalR
+            tradeWin := true
+            expWinRate := expWinRate * (1.0 - ewrAlpha) + 1.0 * ewrAlpha
+        else if finalR < -0.001
+            losses += 1
+            lossSum += -finalR
+            tradeLoss := true
+            expWinRate := expWinRate * (1.0 - ewrAlpha) + 0.0 * ewrAlpha
+        else
+            scratches += 1
+        label.new(bar_index, exitPx, result + " " + fmtR(finalR), style = dir == 1 ? (stopHit ? label.style_label_up : label.style_label_down) : (stopHit ? label.style_label_down : label.style_label_up), color = finalR > 0.001 ? bullCl : finalR < -0.001 ? bearCl : color.gray, textcolor = color.white, size = size.tiny)
+        tradeDir := 0
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Enhanced momentum engine: 12-factor weighted Bayesian confidence
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Adaptive bias: shifts weight emphasis based on recent trade performance
+float momAdapt = useAdaptive ? 0.8 + expWinRate * 0.4 : 1.0
+float strAdapt = useAdaptive ? 1.2 - expWinRate * 0.4 : 1.0
+
+// Base weights (calibrated for forex intraday 15m-1H)
+float w1  = 1.5 * momAdapt   // EMA alignment
+float w2  = 1.2 * momAdapt   // RSI position
+float w3  = 1.3 * momAdapt   // MACD histogram
+float w4  = 0.8 * momAdapt   // MACD signal cross
+float w5  = 1.0 * strAdapt   // VWAP position
+float w6  = 1.4 * momAdapt   // Volume confirmation
+float w7  = 1.0              // ADX regime (no adapt)
+float w8  = 0.8 * strAdapt   // Price vs 50 EMA
+float w9  = 1.0 * momAdapt   // Delta direction
+float w10 = 1.8 * strAdapt   // RSI divergence
+float w11 = 1.6 * strAdapt   // Institutional activity
+float w12 = 0.6              // Kill zone (no adapt)
+float wTotal = w1 + w2 + w3 + w4 + w5 + w6 + w7 + w8 + w9 + w10 + w11 + w12
+
+// ── LONG factor scores (each 0.0 to 1.0) ──
+float f1L = emaF > emaS and close > emaS ? 1.0 : emaF > emaS ? 0.5 : 0.0
+float f2L = rsiV >= 55 and rsiV <= 70 ? 1.0 : (rsiV >= 50 and rsiV < 55) or (rsiV > 70 and rsiV <= 75) ? 0.5 : 0.0
+float f3L = macdHist > 0 and macdHist > nz(macdHist[1]) ? 1.0 : macdHist > 0 ? 0.5 : 0.0
+float f4L = recentMacdBullX ? 1.0 : macdLine > macdSig ? 0.3 : 0.0
+float f5L = close > vwapV ? 1.0 : 0.0
+float f6L = volZ >= 2.0 ? 1.0 : volZ >= 1.0 ? 0.7 : volZ >= 0.5 ? 0.4 : na(volume) ? 0.5 : 0.2
+float f7L = nz(adxVal) >= adxThresh + 10 ? 1.0 : nz(adxVal) >= adxThresh ? 0.7 : 0.2
+float f8L = na(ema50) ? 0.5 : close > ema50 ? 1.0 : 0.0
+float f9L = na(deltaSma) ? 0.5 : deltaBull ? 1.0 : 0.0
+float f10L = useDivFilter and recentBullDiv ? 1.0 : 0.0
+float f11L = math.min((recentStopHuntBull ? 0.5 : 0.0) + (recentAbs ? 0.3 : 0.0) + (aggressiveBull or nz(aggressiveBull[1]) ? 0.3 : 0.0), 1.0)
+float f12L = not intraday ? 0.5 : inKZ ? 1.0 : 0.3
+
+// ── SHORT factor scores ──
+float f1S = emaF < emaS and close < emaS ? 1.0 : emaF < emaS ? 0.5 : 0.0
+float f2S = rsiV >= 30 and rsiV <= 45 ? 1.0 : (rsiV > 45 and rsiV <= 50) or (rsiV >= 25 and rsiV < 30) ? 0.5 : 0.0
+float f3S = macdHist < 0 and macdHist < nz(macdHist[1]) ? 1.0 : macdHist < 0 ? 0.5 : 0.0
+float f4S = recentMacdBearX ? 1.0 : macdLine < macdSig ? 0.3 : 0.0
+float f5S = close < vwapV ? 1.0 : 0.0
+float f6S = f6L
+float f7S = f7L
+float f8S = na(ema50) ? 0.5 : close < ema50 ? 1.0 : 0.0
+float f9S = na(deltaSma) ? 0.5 : deltaBear ? 1.0 : 0.0
+float f10S = useDivFilter and recentBearDiv ? 1.0 : 0.0
+float f11S = math.min((recentStopHuntBear ? 0.5 : 0.0) + (recentAbs ? 0.3 : 0.0) + (aggressiveBear or nz(aggressiveBear[1]) ? 0.3 : 0.0), 1.0)
+float f12S = f12L
+
+// Weighted scores
+float wScoreL = f1L*w1 + f2L*w2 + f3L*w3 + f4L*w4 + f5L*w5 + f6L*w6 + f7L*w7 + f8L*w8 + f9L*w9 + f10L*w10 + f11L*w11 + f12L*w12
+float wScoreS = f1S*w1 + f2S*w2 + f3S*w3 + f4S*w4 + f5S*w5 + f6S*w6 + f7S*w7 + f8S*w8 + f9S*w9 + f10S*w10 + f11S*w11 + f12S*w12
+
+float rawConfL = wTotal > 0 ? wScoreL / wTotal : 0.5
+float rawConfS = wTotal > 0 ? wScoreS / wTotal : 0.5
+
+// Logistic sharpening: creates Bayesian-style S-curve separation
+float sharpK = 6.0
+float clampL = math.max(-10.0, math.min(10.0, sharpK * (rawConfL - 0.5)))
+float clampS = math.max(-10.0, math.min(10.0, sharpK * (rawConfS - 0.5)))
+float confLong  = 1.0 / (1.0 + math.exp(-clampL))
+float confShort = 1.0 / (1.0 + math.exp(-clampS))
+
+// Signal grading
+string gradeLong  = confLong >= 0.80 ? "A+" : confLong >= 0.70 ? "A" : confLong >= 0.60 ? "B" : "C"
+string gradeShort = confShort >= 0.80 ? "A+" : confShort >= 0.70 ? "A" : confShort >= 0.60 ? "B" : "C"
+
+// Confidence gates
+bool momLongOk  = not useMom or confLong >= minConf / 100.0
+bool momShortOk = not useMom or confShort >= minConf / 100.0
+bool regimeOk   = not useRegime or nz(adxVal) >= adxThresh
+
+// Persist for panels
+lastConfLong  := confLong
+lastConfShort := confShort
+
+plot(showMomEma and useMom ? emaF : na, "Fast EMA", color = color.new(color.aqua, 20), linewidth = 1)
+plot(showMomEma and useMom ? emaS : na, "Slow EMA", color = color.new(color.yellow, 20), linewidth = 1)
+plot(showMomEma and useMom ? ema50 : na, "50 EMA", color = color.new(color.white, 60), linewidth = 1)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Signal generation (enhanced with confidence gating & grading)
+// ═══════════════════════════════════════════════════════════════════════════
+float eqMid = (not na(swHigh) and not na(swLow)) ? (swHigh + swLow) / 2 : na
+bool htfLongOk = not (useHtfFlt and htfActive) or htfTrend == 1
+bool htfShortOk = not (useHtfFlt and htfActive) or htfTrend == -1
+bool kzOk = not useKzFlt or inKZ
+bool pdLongOk = not usePdFlt or (not na(eqMid) and close < eqMid)
+bool pdShortOk = not usePdFlt or (not na(eqMid) and close > eqMid)
+
+float sigStop = na
+float sigTarget = na
+float minRisk = minStopAtr * atrS
+float sigConf = 0.0
+string sigGrade = ""
+
+if showSig and tradeDir == 0 and kzOk and regimeOk
+    if trend == 1 and htfLongOk and pdLongOk and momLongOk
+        float ref = touchZone(obs, true, reqSweep, reqDisp, minRisk)
+        if na(ref)
+            ref := touchZone(fvgs, true, reqSweep, reqDisp, minRisk)
+        if not na(ref)
+            float stop = ref - atrS * stopBuf
+            float risk = close - stop
+            if risk > 0
+                sigStop := stop
+                sigTarget := (tpMode == "Swing liquidity" and not na(swHigh) and swHigh > close + risk) ? swHigh : close + risk * rrTarget
+                sigConf := confLong
+                sigGrade := gradeLong
+                longSig := true
+    else if trend == -1 and htfShortOk and pdShortOk and momShortOk
+        float ref = touchZone(obs, false, reqSweep, reqDisp, minRisk)
+        if na(ref)
+            ref := touchZone(fvgs, false, reqSweep, reqDisp, minRisk)
+        if not na(ref)
+            float stop = ref + atrS * stopBuf
+            float risk = stop - close
+            if risk > 0
+                sigStop := stop
+                sigTarget := (tpMode == "Swing liquidity" and not na(swLow) and swLow < close - risk) ? swLow : close - risk * rrTarget
+                sigConf := confShort
+                sigGrade := gradeShort
+                shortSig := true
+
+if longSig or shortSig
+    tradeDir := longSig ? 1 : -1
+    lastDir := tradeDir
+    tEntry := close
+    tStop0 := sigStop
+    tCurStop := sigStop
+    tRisk := math.abs(tEntry - sigStop)
+    tTarget := sigTarget
+    tRR := math.abs(tTarget - tEntry) / tRisk
+    tp1RAct := math.min(tp1R, tRR)
+    tTp1 := tEntry + tradeDir * tRisk * tp1RAct
+    tp1Hit := false
+    realizedR := 0.0
+    tradeBars := 0
+    lastR := 0.0
+    lastResult := "OPEN"
+    entryBar := bar_index
+    lastGrade := sigGrade
+    tpBox := box.new(bar_index, math.max(tEntry, tTarget), bar_index + 1, math.min(tEntry, tTarget), border_color = na, bgcolor = color.new(color.green, 85))
+    slBox := box.new(bar_index, math.max(tEntry, tStop0), bar_index + 1, math.min(tEntry, tStop0), border_color = na, bgcolor = color.new(color.red, 85))
+    tp1Ln := line.new(bar_index, tTp1, bar_index + 1, tTp1, color = useTp1 ? color.blue : na, style = line.style_dotted)
+    stopLn := line.new(bar_index, tStop0, bar_index + 1, tStop0, color = color.red)
+    string gradeColor = sigGrade == "A+" ? "🟢" : sigGrade == "A" ? "🔵" : sigGrade == "B" ? "🟡" : "🟠"
+    string txt = (longSig ? "LONG " : "SHORT ") + sigGrade + " " + str.tostring(math.round(sigConf * 100)) + "%" + "\n" + str.tostring(tEntry, format.mintick) + "\nSL " + str.tostring(tStop0, format.mintick) + (useTp1 ? "\nTP1 " + str.tostring(tTp1, format.mintick) + " (" + str.tostring(tp1RAct, "#.##") + "R, " + str.tostring(tp1Pct, "#") + "%)" : "") + "\nTP2 " + str.tostring(tTarget, format.mintick) + " (" + str.tostring(tRR, "#.##") + "R)"
+    color lblCl = sigGrade == "A+" ? color.lime : sigGrade == "A" ? bullCl : sigGrade == "B" ? color.yellow : color.orange
+    if longSig
+        lblCl := sigGrade == "A+" ? color.lime : sigGrade == "A" ? bullCl : sigGrade == "B" ? color.yellow : color.orange
+    else
+        lblCl := sigGrade == "A+" ? color.fuchsia : sigGrade == "A" ? bearCl : sigGrade == "B" ? color.yellow : color.orange
+    label.new(bar_index, longSig ? low : high, txt, style = longSig ? label.style_label_up : label.style_label_down, color = lblCl, textcolor = color.white, size = size.small)
+
+updateZones(obs)
+updateZones(fvgs)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Premium / discount zones
+// ═══════════════════════════════════════════════════════════════════════════
+if showZones and barstate.islast and not na(swHigh) and not na(swLow)
+    float eq = (swHigh + swLow) / 2
+    int left = math.min(swHighBar, swLowBar)
+    int right = bar_index + 10
+    if na(premBox)
+        premBox := box.new(left, swHigh, right, eq, border_color = na, bgcolor = color.new(color.red, 92))
+        discBox := box.new(left, eq, right, swLow, border_color = na, bgcolor = color.new(color.green, 92))
+        eqLine := line.new(left, eq, right, eq, color = color.gray, style = line.style_dashed)
+    else
+        premBox.set_lefttop(left, swHigh)
+        premBox.set_rightbottom(right, eq)
+        discBox.set_lefttop(left, eq)
+        discBox.set_rightbottom(right, swLow)
+        eqLine.set_xy1(left, eq)
+        eqLine.set_xy2(right, eq)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Stats table
+// ═══════════════════════════════════════════════════════════════════════════
+tblRow(table t, int r, string a, string b, color c) =>
+    t.cell(0, r, a, text_color = color.white, text_halign = text.align_left, text_size = size.small)
+    t.cell(1, r, b, text_color = c, text_halign = text.align_left, text_size = size.small)
+
+gauge(float s) =>
+    int n = math.round(s * 5)
+    str.repeat("|", n) + str.repeat(".", 5 - n)
+
+confRow(table t, int r, string a, float s) =>
+    color c = s >= 0.7 ? color.green : s >= 0.4 ? color.yellow : color.red
+    t.cell(0, r, a, text_color = color.white, text_halign = text.align_left, text_size = size.small)
+    t.cell(1, r, str.tostring(math.round(s * 100)) + "%", text_color = c, text_size = size.small)
+    t.cell(2, r, gauge(s), text_color = c, text_size = size.small)
+
+if showStats and barstate.islast
+    if na(stats)
+        stats := table.new(position.bottom_right, 2, 8, bgcolor = color.new(color.black, 20), border_width = 1)
+    int total = wins + losses + scratches
+    float expectancy = total > 0 ? totalR / total : na
+    tblRow(stats, 0, "Trades (W / L / BE)", str.tostring(total) + " (" + str.tostring(wins) + " / " + str.tostring(losses) + " / " + str.tostring(scratches) + ")", color.white)
+    tblRow(stats, 1, "Win rate", total > 0 ? str.tostring(wins / total * 100, "#.#") + "%" : "-", color.white)
+    tblRow(stats, 2, "Expectancy / trade", na(expectancy) ? "-" : fmtR(expectancy), na(expectancy) ? color.gray : expectancy >= 0 ? bullCl : bearCl)
+    tblRow(stats, 3, "Profit factor", lossSum > 0 ? str.tostring(grossWin / lossSum, "#.##") : grossWin > 0 ? "inf" : "-", color.white)
+    tblRow(stats, 4, "Total return", fmtR(totalR), totalR >= 0 ? bullCl : bearCl)
+    tblRow(stats, 5, "Average loss", losses > 0 ? fmtR(-lossSum / losses) : "-", bearCl)
+    tblRow(stats, 6, "Average bars", total > 0 ? str.tostring(sumBars / total, "#.#") : "-", color.white)
+    tblRow(stats, 7, "Adapt rate", str.tostring(math.round(expWinRate * 100)) + "% (" + (expWinRate > 0.55 ? "momentum" : expWinRate < 0.45 ? "structure" : "balanced") + ")", expWinRate > 0.55 ? color.aqua : expWinRate < 0.45 ? color.orange : color.white)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Trade panel (top right)
+// ═══════════════════════════════════════════════════════════════════════════
+if showTradeP and barstate.islast
+    if na(tradeT)
+        tradeT := table.new(position.top_right, 2, 8, bgcolor = color.new(color.black, 20), border_width = 1)
+    bool isOpen = tradeDir != 0
+    color dirCl = lastDir == 1 ? bullCl : bearCl
+    if lastDir == 0
+        tblRow(tradeT, 0, "Trade", "none yet", color.gray)
+        for r = 1 to 7
+            tblRow(tradeT, r, "", "", color.gray)
+    else
+        float remain = 1.0 - (tp1Hit ? tp1Frac : 0.0)
+        float livePts = (close - tEntry) * lastDir
+        float liveR = realizedR + remain * (livePts / tRisk)
+        tblRow(tradeT, 0, "Trade", (lastDir == 1 ? "LONG" : "SHORT") + " " + lastGrade + " [" + lastResult + "]", dirCl)
+        tblRow(tradeT, 1, "Entry", str.tostring(tEntry, format.mintick), color.yellow)
+        tblRow(tradeT, 2, "P/L", isOpen ? str.tostring(livePts, "#.##") + " pts | " + fmtR(liveR) : fmtR(lastR), (isOpen ? liveR : lastR) >= 0 ? bullCl : bearCl)
+        tblRow(tradeT, 3, "TP1", not useTp1 ? "off" : tp1Hit ? "HIT" : str.tostring(tTp1, format.mintick) + " (" + str.tostring(tp1RAct, "#.##") + "R)", tp1Hit ? bullCl : color.white)
+        tblRow(tradeT, 4, "TP2", str.tostring(tTarget, format.mintick) + " (" + str.tostring(tRR, "#.##") + "R)", color.white)
+        tblRow(tradeT, 5, "Stop", str.tostring(tCurStop, format.mintick) + (tCurStop != tStop0 ? " (BE)" : ""), bearCl)
+        tblRow(tradeT, 6, "Bars", str.tostring(tradeBars), color.white)
+        tblRow(tradeT, 7, "Confidence", str.tostring(math.round(sigConf * 100)) + "%", sigConf >= 0.7 ? color.green : sigConf >= 0.55 ? color.yellow : color.red)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Enhanced confidence panel (bottom left): 12-factor Bayesian breakdown
+// ═══════════════════════════════════════════════════════════════════════════
+if showConf and barstate.islast
+    if na(confT)
+        confT := table.new(position.bottom_left, 3, 13, bgcolor = color.new(color.black, 20), border_width = 1)
+        table.merge_cells(confT, 0, 0, 2, 0)
+    int d = tradeDir != 0 ? tradeDir : trend != 0 ? trend : 1
+    bool isL = d == 1
+    float conf = isL ? confLong : confShort
+    string grade = isL ? gradeLong : gradeShort
+
+    string biasStr = (isL ? "LONG" : "SHORT") + " bias"
+    string verdict = conf >= 0.75 ? "Strong confluence" : conf >= 0.60 ? "Good confluence" : conf >= 0.50 ? "Moderate" : "Weak"
+    color headCl = conf >= 0.75 ? color.new(color.green, 40) : conf >= 0.60 ? color.new(color.teal, 40) : conf >= 0.50 ? color.new(color.orange, 40) : color.new(color.red, 40)
+    confT.cell(0, 0, biasStr + ": " + verdict + " [" + grade + "]", text_color = color.white, text_size = size.small, bgcolor = headCl)
+
+    confT.cell(0, 1, "Confidence", text_color = color.white, text_halign = text.align_left, text_size = size.small)
+    color cCl = conf >= 0.7 ? color.green : conf >= 0.5 ? color.yellow : color.red
+    confT.cell(1, 1, str.tostring(math.round(conf * 100)) + "%", text_color = cCl, text_size = size.small)
+    confT.cell(2, 1, gauge(conf), text_color = cCl, text_size = size.small)
+
+    confRow(confT, 2, "EMA trend", isL ? f1L : f1S)
+    confRow(confT, 3, "RSI", isL ? f2L : f2S)
+    confRow(confT, 4, "MACD", math.max(isL ? f3L : f3S, isL ? f4L : f4S))
+    confRow(confT, 5, "VWAP", isL ? f5L : f5S)
+    confRow(confT, 6, "Volume", isL ? f6L : f6S)
+    confRow(confT, 7, "ADX regime", f7L)
+    confRow(confT, 8, "50 EMA pos", isL ? f8L : f8S)
+    confRow(confT, 9, "Delta flow", isL ? f9L : f9S)
+    confRow(confT, 10, "RSI diverg", isL ? f10L : f10S)
+    confRow(confT, 11, "Institution", isL ? f11L : f11S)
+    confRow(confT, 12, "Kill zone", f12L)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Alerts
+// ═══════════════════════════════════════════════════════════════════════════
+alertcondition(bullBOS, "Bullish BOS", "Bullish break of structure")
+alertcondition(bearBOS, "Bearish BOS", "Bearish break of structure")
+alertcondition(bullCHoCH, "Bullish CHoCH", "Bullish change of character")
+alertcondition(bearCHoCH, "Bearish CHoCH", "Bearish change of character")
+alertcondition(sweepHigh, "Sweep of highs", "Liquidity swept above swing high")
+alertcondition(sweepLow, "Sweep of lows", "Liquidity swept below swing low")
+alertcondition(longSig, "Long signal", "Long entry signal fired")
+alertcondition(shortSig, "Short signal", "Short entry signal fired")
+alertcondition(longSig and confLong >= 0.70, "High-conf long (A+/A)", "High confidence long signal")
+alertcondition(shortSig and confShort >= 0.70, "High-conf short (A+/A)", "High confidence short signal")
+alertcondition(tp1Event, "TP1 hit", "Signal trade reached TP1")
+alertcondition(tradeWin, "Trade closed in profit", "Signal trade closed in profit")
+alertcondition(tradeLoss, "Trade closed at a loss", "Signal trade closed at a loss")
+alertcondition(absorption, "Absorption candle", "Institutional absorption detected (high volume + small body)")
+alertcondition(recentStopHuntBull or recentStopHuntBear, "Stop-hunt reversal", "Stop-hunt reversal pattern (sweep + volume + reversal)")
+alertcondition(recentBullDiv, "Bullish RSI divergence", "RSI bullish divergence detected")
+alertcondition(recentBearDiv, "Bearish RSI divergence", "RSI bearish divergence detected")
